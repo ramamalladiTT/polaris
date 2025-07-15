@@ -11,7 +11,7 @@ import ttsim.front.functional.sim_ttnn as ttnn
 from loguru import logger
 
 
-def main():
+def run_experiment():
     # Open Tenstorrent device
     device = ttnn.open_device(device_id=0)
 
@@ -24,7 +24,7 @@ def main():
         testloader = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=False)
 
         # Pretrained weights
-        weights = torch.load("mlp_mnist_weights.pt")
+        weights = torch.load("workloads/mlp_mnist_weights.pt")
         W1 = weights["W1"]
         b1 = weights["b1"]
         W2 = weights["W2"]
@@ -47,7 +47,7 @@ def main():
         total = 0
 
         for i, (image, label) in enumerate(testloader):
-            if i >= 1:
+            if i >= 5:
                 break
 
             image = image.view(1, -1).to(torch.float32)
@@ -95,4 +95,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_experiment()

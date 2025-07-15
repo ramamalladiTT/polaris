@@ -1,0 +1,8 @@
+workloads:
+  - api: TTSIM
+    name: TTNNMLPMNIST
+    basedir: workloads
+    module: run_experiment@ttnn_mlp_inference_mnist.py
+    params: {'bs': 1}
+    instances:
+        ttnn_renset_block: {}

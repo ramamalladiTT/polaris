@@ -133,8 +133,6 @@ class SimOpHandle:
         #get perf stats for the SimOp -- this also ensures that the output tensor shape/data
         #is well formed
         self.perf_stats = self.sim_op.get_perf_counts(xinput,[self.otensor])
-        self.print_perf_stats()
-
         self.sim_op.update_tensor_counts(xinput,[self.otensor])
 
         #return result
@@ -377,6 +375,12 @@ def ReshapeFixed(name, shape1, **kwargs):
     shape_term = _from_data(name + '.fixshape', is_const=True, data=np.array(shape1, dtype=np.int64))
     shape_term.op_in.append(name)
     op_hndl = SimOpHandle(name, 'Reshape', params=[(1,shape_term)], ipos=[0], **kwargs)
+    return op_hndl
+
+def Permute(name, shape1, **kwargs):
+    shape1_param = _from_shape(name + '.permute', shape1, is_param=True)
+    shape1_param.op_in.append(name)
+    op_hndl = SimOpHandle(name, 'Permute', params=[(1, shape1_param)], ipos=[0], **kwargs)
     return op_hndl
 
 def Linear(name, nrow, ncol, **kwargs):

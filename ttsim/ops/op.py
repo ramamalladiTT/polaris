@@ -285,28 +285,6 @@ class SimOp:
         self.fused_in_optimization = True
         self.fused_with_op         = fused_with_op
 
-    def execute_fn_on_dev(self, device):
-        #find compute cycles
-        self.compute_cycles = 0
-        if TYPE_CHECKING:
-            assert self.perf_stats is not None
-        for instr,instr_count in self.perf_stats['instrs'].items():
-            peak_ipc = 1 #device.peak_ipc(self.uses_compute_pipe, instr, self.precision)
-            real_ipc = peak_ipc * G_COMPUTE_UTIL_CONSTANT
-            self.compute_cycles += math.ceil(instr_count / real_ipc)
-        #find memory cycles
-        mem_rd_GB     = self.perf_stats['inBytes'] / 1024 / 1024 / 1024
-        mem_wr_GB     = self.perf_stats['outBytes'] / 1024 / 1024 / 1024
-        freq_MHz      = 1000 #device.frequency(self.uses_compute_pipe, units='MHz')
-        peak_bw_GBps  = 100 #device.peak_bandwidth(freq_units="GHz")
-        bw_GBps       = peak_bw_GBps * G_MEMORY_UTIL_CONSTANT
-        #convert to device clk cycles
-        self.mem_rd_cycles = math.ceil((mem_rd_GB / bw_GBps) * freq_MHz * 1e6)
-        self.mem_wr_cycles = math.ceil((mem_wr_GB / bw_GBps) * freq_MHz * 1e6)
-
-        return
-
-
     def execute(self, device):
         if TYPE_CHECKING:
             assert self.perf_stats is not None, f"SimOp {self.name} has no perf_stats set, cannot execute"
@@ -1371,6 +1349,26 @@ class ReshapeOp(SimOp):
             return {grad_tinfo.name: grad_tinfo}
         else:
             return {}
+
+class PermuteOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'Permute'
+        check_io_counts( self, in_counts=[2,2], out_counts=[1,1] )
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+        outT[0].shape = inT[1].shape
+        outT[0].dtype = inT[0].dtype
+        self.perf_stats = {
+                'inElems' : inT[0].nelems(),
+                'outElems': outT[0].nelems(),
+                'inBytes' : inT[0].nbytes(),
+                'outBytes': outT[0].nbytes(),
+                'instrs'  : {'mov': outT[0].nelems()}
+                }
+        return self.perf_stats
 
 class TransposeOp(SimOp):
     def __init__(self, opinfo):
@@ -2591,6 +2589,7 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             MatMulOp             : ['MatMul'],
             SplitOp              : ['Split'],
             ReshapeOp            : ['Reshape'],
+            PermuteOp            : ['Permute'],
             TransposeOp          : ['Transpose'],
             WhereOp              : ['Where'],
             SoftmaxOp            : ['Softmax'],

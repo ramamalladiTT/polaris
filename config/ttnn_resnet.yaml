@@ -1,0 +1,8 @@
+workloads:
+  - api: TTSIM
+    name: TTNNRESNET
+    basedir: workloads
+    module: run_experiment@ttnn_resnet_block.py
+    params: {'bs': 1}
+    instances:
+        ttnn_renset_block: {}

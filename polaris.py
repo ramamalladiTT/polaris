@@ -26,6 +26,14 @@ from ttsim.utils.common import get_ttsim_functional_instance, print_csv, str_to_
 from ttsim.utils.types import get_sim_dtype, get_bpe
 import ttsim.config.runcfgmodel as runcfgmodel
 
+# define a device_config for use in immediate mode
+device_config = {
+    'device_list': None,
+    'devspec': None,
+    'op2rsrc': None,
+    'op2dt': None
+}
+
 """ Polaris top-level executable. """
 
 LOG   = logger
@@ -280,7 +288,11 @@ def setup_cmdline_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--wlspec',    '-w', required=True, help="Workloads Specification")
     parser.add_argument('--archspec',  '-a', required=True, help="Architecture Specification")
     parser.add_argument('--wlmapspec', '-m', required=True, help="Workload To Architecture Mapping Specification")
+<<<<<<< HEAD
     parser.add_argument('--datatype', '-d', type=str, default=None, choices=data_types, help="Activation Data Type to use for the projection")
+=======
+    parser.add_argument('--immediate_mode',   '-e', help="Execute in immediate mode", type=str_to_bool, default=False)
+>>>>>>> 4967d52 (Added ttnn examples: ttnn_add, ttnn_mlp_inference_mnist, ttnn_resnet_block, ttnn_bert_tiny)
 
     parser.add_argument('--filterwlg',  default=None, help="use only workload-groups specified in filterwlg (comma sep list)")
     parser.add_argument('--filterwl',   default=None, help="use only workloads specified in filterwl (comma sep list)")
@@ -415,7 +427,6 @@ def execute_wl_on_dev(_wl, _dl, _wspec, _dspec, wlmapspec, _WLG,
     for exp_no, (exp_wl, exp_dev) in enumerate(ALL_EXPS):
         wlgroup, wlname, wlins_name, wlins_cfg, wlbatch = exp_wl
         devname, devfreq                                = exp_dev
-
         dev_obj   = _dspec[devname]
         if devfreq is not None:
             dev_obj.set_frequency(devfreq) #override device frequency is we have freqsweep
@@ -561,6 +572,21 @@ def execute_wl_on_dev(_wl, _dl, _wspec, _dspec, wlmapspec, _WLG,
 
     return num_failures, _summary_stats
 
+def set_device_config(dev_list, devspec, OP2RSRC, OP2DT):
+    """
+    Set the global device configuration for Polaris simulation.
+
+    Args:
+        dev_list (list): List of device specifications.
+        devspec (dict): Device specifications dictionary.
+    """
+    global device_config
+    device_config = {
+        'device_list': dev_list,
+        'devspec': devspec,
+        'op2rsrc': OP2RSRC,
+        'op2dt': OP2DT
+    }
 
 def polaris(args: argparse.Namespace | runcfgmodel.PolarisRunConfig) -> int:
     """Main entry point for the Polaris simulation."""
@@ -593,6 +619,42 @@ def polaris(args: argparse.Namespace | runcfgmodel.PolarisRunConfig) -> int:
     if args.dryrun:
         do_dryrun(workload_list, device_list)
         tot_exp_run = 0
+    elif args.immediate_mode:
+        tot_exp_run = 1
+        set_device_config(device_list, devspec, OP2RSRC, OP2DT)
+        sys.modules['polaris'] = sys.modules[__name__]  # Ensure polaris module is available in the current context
+
+        import importlib.util
+        def invoke_function_from_path(fn_spec: str, *args, **kwargs):
+            """
+            Invoke a function specified as 'path/fn@file.py'.
+
+            Args:
+                fn_spec (str): Function spec in the format 'path/fn@file.py'.
+                *args: Positional arguments for the function.
+                **kwargs: Keyword arguments for the function.
+
+            Returns:
+                Any: Result of the function call.
+            """
+            # Parse the spec
+            if '@' not in fn_spec:
+                raise ValueError("Function spec must be in the format 'path/fn@file.py'")
+            fn_path, file_path = fn_spec.split('@', 1)
+            # If file_path is not an absolute path, join with fn_path's directory
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(os.path.dirname(fn_path), file_path)
+            fn_name = fn_path.split('/')[-1]
+            # Load the module from file
+            spec = importlib.util.spec_from_file_location("dynamic_module", file_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # Get the function and invoke
+            func = getattr(module, fn_name)
+            return func(*args, **kwargs)
+
+        invoke_function_from_path(workload_list[0][3]['path'])
     else:
         workload_graphs = create_uniq_workloads_tbl(workload_list)
 
@@ -624,31 +686,14 @@ def polaris(args: argparse.Namespace | runcfgmodel.PolarisRunConfig) -> int:
     return 0 if num_failures == 0 else 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    # args, freqsweep, batchsweep = setup_cmdline_args()
-    args = setup_cmdline_args(argv)
-    return polaris(args)
-
-
-if __name__ == '__main__':
-    start_time = time.perf_counter()
-    num_exps   = main()
-    end_time   = time.perf_counter()
-    del_time   = end_time - start_time
-
-    if num_exps > 0:
-        print(f"Completed {num_exps} jobs in {del_time:0.2f} seconds @ {num_exps/del_time:.0f} jobs per sec")
-    else:
-        print()
-
-def execute_simophandle(op_handle, input_tensors, device_obj=None, op_attrs=None):
+def execute_simophandle(op_handle, input_tensors, device=None, op2rsrc=None, op2dt=None, op_attrs=None):
     """
     Execute simulation operation handle to get simulation clocks for operations.
 
     Args:
         op_handle: SimOpHandle instance from functional/op.py
         input_tensors: List of input tensor specifications
-        device_obj: Device object with architecture specifications
+        device: Device with architecture specifications
         op_attrs: Optional operation attributes dictionary
 
     Returns:
@@ -656,7 +701,6 @@ def execute_simophandle(op_handle, input_tensors, device_obj=None, op_attrs=None
     """
     import logging
     from ttsim.front.functional.op import SimOpHandle
-
     LOG = logging.getLogger(__name__)
 
     # Validate op_handle type
@@ -682,9 +726,8 @@ def execute_simophandle(op_handle, input_tensors, device_obj=None, op_attrs=None
     }
 
     # Get device frequency for the operation
-    uses_compute_pipe = getattr(op_handle, 'uses_compute_pipe', 'matrix')
-    dev_freq_MHz = 2000; #device_obj.frequency(uses_compute_pipe, units='MHz')
-
+    uses_compute_pipe = op2rsrc
+    dev_freq_MHz = device.frequency(uses_compute_pipe, units='MHz')
     # Use SimOpHandle's get_perf_counts method if available
     all_itensors = op_handle.params + list(zip(op_handle.ipos, input_tensors))
     sorted_all_itensors = sorted(all_itensors, key=lambda v: v[0])
@@ -703,7 +746,15 @@ def execute_simophandle(op_handle, input_tensors, device_obj=None, op_attrs=None
     op_handle.perf_stats = sim_op.get_perf_counts(xinput,op_handle.opinfo['outList'])
     op_handle.print_perf_stats()
     sim_op.update_tensor_counts(xinput,[op_handle.otensor])
-    sim_op.execute_fn_on_dev(device_obj)
+    sim_op.uses_compute_pipe = uses_compute_pipe
+    for op_type_x, data_type_x in op2dt:
+        op_type = sim_op.optype.upper()
+        if op_type_x == '*':
+            sim_op.set_precision(data_type_x)
+        elif op_type == op_type_x:
+            sim_op.set_precision(data_type_x)
+
+    sim_op.execute(device)
     compute_cycles = getattr(op_handle, 'compute_cycles', sim_op.compute_cycles)
     mem_rd_cycles = getattr(op_handle, 'mem_rd_cycles', sim_op.mem_rd_cycles)
     mem_wr_cycles = getattr(op_handle, 'mem_wr_cycles', sim_op.mem_wr_cycles)
@@ -711,8 +762,26 @@ def execute_simophandle(op_handle, input_tensors, device_obj=None, op_attrs=None
     print(f"Executed {op_handle.optype} simulation: {compute_cycles} compute cycles, "
          f"{mem_rd_cycles} mem read cycles, {mem_wr_cycles} mem write cycles")
     # Add ramp penalty following polaris.py pattern
-    ramp_penalty = 5 #device_obj.ramp_penalty() if hasattr(device_obj, 'ramp_penalty') else 0
+    ramp_penalty = device.ramp_penalty() if hasattr(device, 'ramp_penalty') else 0
 
     mem_cycles = mem_rd_cycles + mem_wr_cycles
     print(f"compute_cycles: {compute_cycles}, mem_cycles: {mem_cycles}, ramp_penalty: {ramp_penalty}")
     return op_handle.otensor
+
+
+def main(argv: list[str] | None = None) -> int:
+    # args, freqsweep, batchsweep = setup_cmdline_args()
+    args = setup_cmdline_args(argv)
+    return polaris(args)
+
+
+if __name__ == '__main__':
+    start_time = time.perf_counter()
+    num_exps   = main()
+    end_time   = time.perf_counter()
+    del_time   = end_time - start_time
+
+    if num_exps > 0:
+        print(f"Completed {num_exps} jobs in {del_time:0.2f} seconds @ {num_exps/del_time:.0f} jobs per sec")
+    else:
+        print()

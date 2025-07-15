@@ -1,0 +1,10 @@
+workloads:
+  - api: TTSIM
+    name: TTNNADD
+    basedir: workloads
+    module: main@ttnn_add_tensors.py
+    input_size: 1024
+    output_size: 1024
+    params: {'bs': 1}
+    instances:
+        ttnn_add: {}
