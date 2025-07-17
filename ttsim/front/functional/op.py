@@ -91,19 +91,6 @@ class SimOpHandle:
         if self.link_module == None:
             self.link_module = m
 
-    def print_perf_stats(self):
-        if self.perf_stats is not None:
-            print(f"SimOpHandle({self.name}) perf stats: {self.perf_stats}")
-        else:
-            print(f"SimOpHandle({self.name}) perf stats not available yet")
-        return
-
-    def get_simulator_op(self):
-        return get_sim_op(self.opinfo)
-
-    def get_otensor(self):
-        return get_output(self.name)
-
     def __call__(self, *xargs):
         assert len(xargs) == len(self.ipos), \
                 f"Length for inputs {len(xargs)} & ipos {len(self.ipos)} don't match"
@@ -375,12 +362,6 @@ def ReshapeFixed(name, shape1, **kwargs):
     shape_term = _from_data(name + '.fixshape', is_const=True, data=np.array(shape1, dtype=np.int64))
     shape_term.op_in.append(name)
     op_hndl = SimOpHandle(name, 'Reshape', params=[(1,shape_term)], ipos=[0], **kwargs)
-    return op_hndl
-
-def Permute(name, shape1, **kwargs):
-    shape1_param = _from_shape(name + '.permute', shape1, is_param=True)
-    shape1_param.op_in.append(name)
-    op_hndl = SimOpHandle(name, 'Permute', params=[(1, shape1_param)], ipos=[0], **kwargs)
     return op_hndl
 
 def Linear(name, nrow, ncol, **kwargs):

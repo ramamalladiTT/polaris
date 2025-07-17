@@ -1350,26 +1350,6 @@ class ReshapeOp(SimOp):
         else:
             return {}
 
-class PermuteOp(SimOp):
-    def __init__(self, opinfo):
-        super().__init__(opinfo)
-        self.opclass_str: str = 'Permute'
-        check_io_counts( self, in_counts=[2,2], out_counts=[1,1] )
-
-    def get_perf_counts(self, inT, outT, **kwargs):
-        if self.perf_stats is not None:
-            return self.perf_stats
-        outT[0].shape = inT[1].shape
-        outT[0].dtype = inT[0].dtype
-        self.perf_stats = {
-                'inElems' : inT[0].nelems(),
-                'outElems': outT[0].nelems(),
-                'inBytes' : inT[0].nbytes(),
-                'outBytes': outT[0].nbytes(),
-                'instrs'  : {'mov': outT[0].nelems()}
-                }
-        return self.perf_stats
-
 class TransposeOp(SimOp):
     def __init__(self, opinfo):
         super().__init__(opinfo)
@@ -2589,7 +2569,6 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             MatMulOp             : ['MatMul'],
             SplitOp              : ['Split'],
             ReshapeOp            : ['Reshape'],
-            PermuteOp            : ['Permute'],
             TransposeOp          : ['Transpose'],
             WhereOp              : ['Where'],
             SoftmaxOp            : ['Softmax'],

@@ -38,12 +38,6 @@ class SimTensor:
             s += f", link_module={self.link_module.name}"
         return s
 
-    def __add__(self, other):
-        if isinstance(other, SimTensor):
-            return SimTensor({'name': self.name, 'shape': self.shape, 'dtype': self.dtype})
-        else:
-            raise TypeError(f"Unsupported type for addition: {type(other)}")
-
     def rank(self): return len(self.shape)
 
     # Note: data count may not be a simple product of shape dims - may need to provide a custom func
