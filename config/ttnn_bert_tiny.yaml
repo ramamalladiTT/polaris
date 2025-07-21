@@ -1,8 +1,0 @@
-workloads:
-  - api: TTSIM
-    name: TTNNBERTTINY
-    basedir: workloads
-    module: test_perf_bert_tiny@ttnn_bert_tiny.py
-    params: {'bs': 1}
-    instances:
-        ttnn_renset_block: {}

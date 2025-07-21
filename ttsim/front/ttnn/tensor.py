@@ -22,7 +22,7 @@ class DataType(Enum):
 
     @classmethod
     def enumvalue(cls, s:str):
-        return layout[s.upper()]
+        return DataType[s.upper()]
 
     @property
     def itemsize(self)->int:
@@ -60,7 +60,7 @@ class Layout(Enum):
 
     @classmethod
     def enumvalue(cls, s:str):
-        return layout[s.upper()]
+        return Layout[s.upper()]
 
     @property
     def cname(self)->str:
