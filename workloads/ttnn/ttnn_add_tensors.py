@@ -1,11 +1,12 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+#!/usr/bin/env python
+# SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
 import os, sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-import ttsim.front.functional.sim_ttnn as ttnn
-from loguru import logger
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
+import ttsim.front.ttnn as ttnn
+from loguru import logger
 
 def main():
     # Open Tenstorrent device
@@ -39,6 +40,10 @@ def main():
         # Log output tensor
         logger.info("Output tensor:")
         logger.info(tt_result)
+
+        #check graph via onnx dump
+        g = device.get_graph()
+        g.graph2onnx('ttnn_add_tensors.onnx')
 
     finally:
         # Close Tenstorrent device

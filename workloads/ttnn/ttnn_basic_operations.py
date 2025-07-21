@@ -1,11 +1,14 @@
+#!/usr/bin/env python
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-import numpy as np
 import os, sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-import ttsim.front.functional.sim_ttnn as ttnn
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
+import ttsim.front.ttnn as ttnn
+
+#import torch
+import numpy as np
 from loguru import logger
 
 
@@ -19,7 +22,8 @@ def main():
             return ttnn.from_torch(torch_tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         logger.info("\n--- TT-NN Tensor Creation with Tiles (32x32) ---")
-        host_rand = torch.rand((32, 32), dtype=torch.float32)
+        #host_rand = torch.rand((32, 32), dtype=torch.float32)
+        host_rand = ttnn._rand((32, 32), dtype=ttnn.float32)
 
         tt_t1 = ttnn.full(
             shape=(32, 32),
@@ -40,10 +44,11 @@ def main():
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
-        tt_t4 = to_tt_tile(host_rand)
 
+        tt_t4 = to_tt_tile(host_rand)
         t5 = np.array([[5, 6], [7, 8]], dtype=np.float32).repeat(16, axis=0).repeat(16, axis=1)
-        tt_t5 = ttnn.Tensor(t5, device=device, layout=ttnn.TILE_LAYOUT)
+        #tt_t5 = ttnn.Tensor(t5, device=device, layout=ttnn.TILE_LAYOUT)
+        tt_t5 = ttnn.Tensor(t5, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32)
 
         logger.info(f"Tensor from fill value 1:\n{ttnn.to_torch(tt_t1)}")
         logger.info(f"Zeros:\n{ttnn.to_torch(tt_t2)}")
@@ -65,11 +70,19 @@ def main():
         ttnn_matmul = ttnn.to_torch(matmul_result)
         logger.info(f"Matrix Multiplication:\n{ttnn_matmul}")
 
-        logger.info("\n--- Simulated Broadcasting (32x32 + Broadcasted Row Vector) ---")
-        broadcast_vector = torch.tensor([[1.0] * 32], dtype=torch.float32).repeat(32, 1)
-        broadcast_tt = to_tt_tile(broadcast_vector)
-        broadcast_add_result = ttnn.add(tt_t4, broadcast_tt)
-        logger.info(f"Broadcast Add Result (TT-NN):\n{ttnn.to_torch(broadcast_add_result)}")
+        #logger.info("\n--- Simulated Broadcasting (32x32 + Broadcasted Row Vector) ---")
+        ##broadcast_vector = torch.tensor([[1.0] * 32], dtype=torch.float32).repeat(32, 1)
+        #broadcast_vector = ttnn.Tensor(np.array([[1.0] * 32], dtype=np.float32).repeat(32, 1),
+        #                               dtype=ttnn.float32)
+        #broadcast_tt = to_tt_tile(broadcast_vector)
+        #broadcast_add_result = ttnn.add(tt_t4, broadcast_tt) #Polaris ERROR:Shapes [32, 32] and [1, 1024] not broadcast-compatible 
+        #logger.info(f"Broadcast Add Result (TT-NN):\n{ttnn.to_torch(broadcast_add_result)}")
+
+        #check graph via onnx dump
+        g = device.get_graph()
+        g.graph2onnx('ttnn_basic_operations.onnx', do_model_check=False)
+        #model check = False for graph2onnx because memory_config is not a valid ONNX attribute
+
 
     finally:
         ttnn.close_device(device)
