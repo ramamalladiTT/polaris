@@ -58,7 +58,7 @@ def main():
 
         logger.info("\n--- TT-NN Tensor Operations on (32x32) Tiles ---")
         add_result = ttnn.add(tt_t3, tt_t4)
-        mul_result = ttnn.mul(tt_t4, tt_t5)
+        mul_result = ttnn.multiply(tt_t4, tt_t5)
         matmul_result = ttnn.matmul(tt_t3, tt_t4, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         ttnn_add = ttnn.to_torch(add_result)

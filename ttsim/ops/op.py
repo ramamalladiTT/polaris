@@ -2467,7 +2467,7 @@ class ReduceOp(SimOp):
                 'inBytes' : sum([x.nbytes(self.precision) for x in inT]),
                 'outElems': outT[0].nelems(),
                 'outBytes': outT[0].nbytes(self.precision),
-                'instrs'  : instr_profile[optype]
+                'instrs'  : instr_profile[self.optype]
                 }
 
         return self.perf_stats
