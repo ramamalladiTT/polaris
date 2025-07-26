@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
+from ttsim.ops.op import SimOpFactory
 from ttsim.ops.tensor import SimTensor
 from .device import Device
 
@@ -13,8 +14,9 @@ import numpy as np
 class DataType(Enum):
     UINT8     = auto()
     UINT16    = auto()
-    INT32     = auto()
     UINT32    = auto()
+    INT32     = auto()
+    INT64     = auto()
     FLOAT32   = auto()
     BFLOAT16  = auto()
     BFLOAT8_B = auto()
@@ -29,8 +31,9 @@ class DataType(Enum):
         return {
                 'UINT8'     : 1,
                 'UINT16'    : 2,
-                'INT32'     : 4,
                 'UINT32'    : 4,
+                'INT32'     : 4,
+                'INT64'     : 8,
                 'FLOAT32'   : 4,
                 'BFLOAT16'  : 2,
                 'BFLOAT8_B' : 2,
@@ -42,8 +45,9 @@ class DataType(Enum):
         return {
                 'UINT8'     : np.dtype(np.uint8),
                 'UINT16'    : np.dtype(np.uint16),
-                'INT32'     : np.dtype(np.int32),
                 'UINT32'    : np.dtype(np.uint32),
+                'INT32'     : np.dtype(np.int32),
+                'INT64'     : np.dtype(np.int64),
                 'FLOAT32'   : np.dtype(np.float32),
                 'BFLOAT16'  : np.dtype(np.float32), #float16 not supported in onnx dump!!
                 'BFLOAT8_B' : np.dtype(np.float32),
@@ -108,9 +112,58 @@ class Tensor(SimTensor):
     def __str__(self):
         return f"{super().__str__()} ==> ttnn: {self.device}, {self.layout}"
 
+    @property
+    def T(self):
+        opname = self.name + '.transpose_op'
+        optype = 'Transpose'
+        perm   = [i for i in range(self.rank())]
+        perm[-2], perm[-1] = perm[-1], perm[-2] #swap last 2 dims
+        opinfo = {'name': opname, 'optype': optype, 'inList': [self.name], 'attrs': {'perm': perm}}
+        outT   = Tensor(name=opname + '.out', op_out=[opname], device=self.device)
+        opinfo['outList'] = [outT.name]
 
-def _rand(shape, dtype):
-    return Tensor(shape=shape, dtype=dtype)
+        opcls  = SimOpFactory(optype)
+        opobj  = opcls(opinfo)
+        pstats = opobj.get_perf_counts([self], [outT])
+
+        self.device.add_op(opobj)
+
+        return outT
+
+    def view(self, *args):
+        npdata = np.array(args, dtype=np.int64)
+        opname = self.name + '.view_op'
+        shapeT = Tensor(name=opname + '.shapeT',device=self.device, data=npdata,
+                        shape=list(npdata.shape), dtype=DataType.INT64, op_in=[opname])
+        optype = 'Reshape'
+        opinfo = {'name': opname, 'optype': optype, 'inList': [self.name, shapeT.name]}
+        outT   = Tensor(name=opname + '.out', op_out=[opname], device=self.device)
+        opinfo['outList'] = [outT.name]
+
+        opcls  = SimOpFactory(optype)
+        opobj  = opcls(opinfo)
+        pstats = opobj.get_perf_counts([self, shapeT], [outT])
+
+        self.device.add_op(opobj)
+
+        return outT
+
+    def to(self, dt):
+        self.dtype = dt.to_numpy
+        return self
+
+    def item(self):
+        """ returns the Python scalar value of the tensor if the tensor has exactly one element
+        (i.e., it is a 0-dimensional tensor or a scalar tensor). If the tensor has more than one
+        element, calling item() will raise an error. If the tensor is empty/None item fails again!!
+        """
+        assert self.shape == [1], f"Tensor item() is valid only for tensor with exactly one element: {self.shape}"
+        assert self.data is not None, f"Tensor item() called for missing data: {self.data}"
+        return self.data[0]
+
+
+def _rand(shape, dtype, device=None):
+    return Tensor(shape=shape, dtype=dtype, device=device)
 
 def zeros(shape, dtype, layout, device):
     return Tensor(shape=shape, dtype=dtype, layout=layout, device=device, fill_value=0)

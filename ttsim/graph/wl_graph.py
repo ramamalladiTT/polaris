@@ -241,7 +241,8 @@ class WorkloadGraph():
                 raise RuntimeError(f'operator {self._ops[node].optype} not mapped on the device')
         return
 
-    def graph2onnx(self, onnx_filename, /, producer_name="ttsim.functional.export", do_model_check=True):
+    def graph2onnx(self, onnx_filename, /, producer_name="ttsim.functional.export",
+                   do_model_check=True, filter_op_attrs=None):
         nptype_map = {
                 np.float32: TensorProto.FLOAT,
                 np.float64: TensorProto.FLOAT,
@@ -293,7 +294,11 @@ class WorkloadGraph():
 
         onnx_nodes = {}
         for oname, op in self._ops.items():
-            onnx_nodes[oname] = make_node(op.optype, op.inList, op.outList, name=oname, **op.attrs)
+            if filter_op_attrs is not None:
+                onnx_attrs = filter_op_attrs(op.attrs)
+            else:
+                onnx_attrs = op.attrs
+            onnx_nodes[oname] = make_node(op.optype, op.inList, op.outList, name=oname, **onnx_attrs)
 
         input_list        = [onnx_tensors[x] for x in self.get_input_tensors() if x in onnx_tensors]
         output_list       = [onnx_tensors[x] for x in self.get_output_tensors() if x in onnx_tensors]

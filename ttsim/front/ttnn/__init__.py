@@ -8,8 +8,10 @@ from .op     import *
 
 float32  = DataType.FLOAT32
 bfloat16 = DataType.BFLOAT16
+int64    = DataType.INT64
 
-TILE_LAYOUT = Layout.TILE_LAYOUT
+ROW_MAJOR_LAYOUT = Layout.ROW_MAJOR_LAYOUT
+TILE_LAYOUT      = Layout.TILE_LAYOUT
 
 DRAM_MEMORY_CONFIG = 1 #placeholder
 
