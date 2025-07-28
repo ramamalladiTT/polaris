@@ -19,6 +19,7 @@ class dict2obj:
     def __init__(self, d):
         for k,v in d.items():
             setattr(self, k, dict2obj(v) if isinstance(v, dict) else v)
+
     def __getattr__(self, item):
         raise AttributeError(f"Attribute '{item}' not found!!")
 

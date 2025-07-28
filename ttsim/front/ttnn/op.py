@@ -5,10 +5,12 @@
 from ttsim.ops.op import SimOpFactory
 from .tensor import Tensor, DataType, Layout
 from .buffer import TensorMemoryLayout
+from .memory import MemoryConfig
 
 from enum import Enum, auto
 from itertools import count
 from dataclasses import dataclass
+import numpy as np
 
 @dataclass
 class Conv2dConfig:
@@ -53,7 +55,7 @@ def single_output_immediate_op(optype, /, preprocess=None):
     def _impl(*args, **kwargs):
 
         if preprocess:
-            preprocess(args, kwargs)
+            args, kwargs = preprocess(args, kwargs)
 
         tensor_args = [x for x in args if isinstance(x, Tensor)]
         devchk_list = [x.device for x in tensor_args]
@@ -88,7 +90,20 @@ def argmax_pp(args_list, kwargs_dict):
         kwargs_dict['keepdims'] = 1 if kwargs_dict['keepdim'] else 0
     else:
         kwargs_dict['keepdims'] = 0
-    return
+    return args_list, kwargs_dict
+
+def reshape_pp(args_list, kwargs_dict):
+    assert len(args_list) == 2, f"ttnn.reshape has 2 inputs"
+    inT      = args_list[0]
+    outShape = args_list[1]
+    assert isinstance(inT, Tensor), f"ttnn.reshape 1st input should be a ttnn.Tensor"
+    assert isinstance(outShape, (list, tuple)), f"ttnn.reshape 2nd input should be a list|tuple of ints"
+    assert all(isinstance(x, int) for x in outShape), f"ttnn.reshape 2nd input should be a list|tuple of ints"
+
+    outData = np.array(outShape, dtype=np.int64)
+    outT = Tensor(shape=outData.shape, dtype=DataType.INT64, device=inT.device, data=outData)
+    return (inT, outT), kwargs_dict
+
 
 #Pointwise Unary
 cos         = single_output_immediate_op('Cos')
@@ -117,7 +132,7 @@ argmax      = single_output_immediate_op('ArgMax', preprocess=argmax_pp)
 
 #Data Movement
 concat      = single_output_immediate_op('Concat')
-reshape     = single_output_immediate_op('Reshape')
+reshape     = single_output_immediate_op('Reshape', preprocess=reshape_pp)
 
 #Normalization
 layer_norm  = single_output_immediate_op('LayerNormalization')
@@ -132,7 +147,6 @@ max_pool2d        = single_output_immediate_op('MaxPool')
 
 #Matrix Multiplication
 matmul      = single_output_immediate_op('MatMul')
-linear      = matmul
 
 #NEEDED
 #permute, embedding, Conv2dConfig
@@ -158,3 +172,44 @@ linear      = matmul
 #NonMaxSuppressionOp  : ['NonMaxSuppression']
 #FlattenOp            : ['Flatten'], #Yolo-v7
 #AveragePoolOp        : ['AveragePool'],
+
+#Mutli-operator functions
+def linear(*args, **kwargs):
+    assert len(args) == 2, f"linear args #-inputs({len(args)}) != 2"
+    A, B        = args[0], args[1]
+    bias        = kwargs.get('bias',                   None)
+    act         = kwargs.get('activation',             None)
+    #t_A         = kwargs.get('transpose_a',            False)
+    #t_B         = kwargs.get('transpose_b',            False)
+    #dtype       = kwargs.get('dtype',                  None)
+    #otile       = kwargs.get('output_tile',            None)
+    #opt_otensor = kwargs.get('optional_output_tensor', None)
+    #core_grid   = kwargs.get('core_grid',              None)
+    #mem_cfg     = kwargs.get('memory_config',          MemoryConfig.DRAM)
+    #pgm_cfg     = kwargs.get('program_config',         None)
+    #ckrnl_cfg   = kwargs.get('compute_kernel_config',  None)
+
+    not_impl_attrs = {
+            'transpose_a'           : False,
+            'transpose_b'           : False,
+            'dtype'                 : None,
+            'output_tile'           : None,
+            'optional_output_tensor': None,
+            'core_grid'             : None,
+            #'memory_config'         : MemoryConfig.DRAM,
+            'program_config'        : None,
+            'compute_kernel_config' : None,
+            }
+
+    for aname,adefval in not_impl_attrs.items():
+        if aname in kwargs:
+            assert kwargs[aname] == adefval, f"linear.attrib: {aname} = {kwargs[aname]} not implemented yet!!"
+
+    C = matmul(A, B)
+    if bias is not None:
+        C = add(C, bias)
+    if act is not None:
+        act_op = { 'relu': relu }[act]
+        C = act_op(C)
+    return C
+
