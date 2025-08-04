@@ -1,3 +1,7 @@
+#!/usr/bin/env python
+# SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
 mrm8488/bert-tiny-finetuned-squadv2.cfg_0:
   _attn_implementation_autoset: false
   _attn_implementation_internal: null
