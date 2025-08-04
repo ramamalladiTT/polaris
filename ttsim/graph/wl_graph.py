@@ -246,6 +246,10 @@ class WorkloadGraph():
         nptype_map = {
                 np.float32: TensorProto.FLOAT,
                 np.float64: TensorProto.FLOAT,
+                np.uint8:   TensorProto.UINT8,
+                np.uint16:  TensorProto.UINT16,
+                np.uint32:  TensorProto.UINT32,
+                np.int32:   TensorProto.INT32,
                 np.int64:   TensorProto.INT64,
                 np.bool_:   TensorProto.BOOL,
                 }
