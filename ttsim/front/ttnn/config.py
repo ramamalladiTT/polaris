@@ -12,8 +12,8 @@ from dataclasses import dataclass
 @dataclass
 class Conv2dConfig:
     weights_dtype                   : DataType
-    activation                      : str
     shard_layout                    : TensorMemoryLayout
+    activation                      : str  = 'relu'
     deallocate_activation           : bool = False
     reallocate_halo_output          : bool = True
     reshard_if_not_optimal          : bool = False

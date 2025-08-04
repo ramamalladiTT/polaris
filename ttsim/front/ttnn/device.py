@@ -7,6 +7,8 @@ from ttsim.graph import WorkloadGraph
 from enum import Enum, auto
 from dataclasses import dataclass
 
+from typing import Any
+
 ################################x################################x################################x################################
 # utility types ---  mostly from tt-umd
 ChipId       = int
@@ -56,7 +58,7 @@ class BoardType(Enum):
 
 class Device:
     def __init__(self, **kwargs):
-        self.device_id            : int = kwargs.get('device_id')
+        self.device_id            : (Any|int) = kwargs.get('device_id')
         self.l1_small_size        : int = kwargs.get('l1_small_size',        0)
         self.trace_region_size    : int = kwargs.get('trace_region_size',    0)
         self.worker_l1_size       : int = kwargs.get('worker_l1_size',       0)
@@ -84,7 +86,7 @@ class Device:
         #TODO: Check this logic
         return 1
 
-    def compute_with_storage_grid_size(self, grid_x: int = None, grid_y: int = None):
+    def compute_with_storage_grid_size(self, grid_x: (Any | int) = None, grid_y: (Any | int) = None):
 
         if grid_x is not None: self.grid_x = grid_x
         if grid_y is not None: self.grid_y = grid_y

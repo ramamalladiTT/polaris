@@ -181,15 +181,13 @@ max_pool2d        = single_output_immediate_op('MaxPool')
 matmul      = single_output_immediate_op('MatMul')
 
 
-Tensor.__add__ = add
-#Tensor.__sub__ = subtract
-Tensor.__mul__ = multiply
-#Tensor.__div__ = div
-#Tensor.__pow__ = pow
-
-Tensor.__matmul__ = matmul
-
-Tensor.reshape = reshape
+Tensor.__add__    = add       #type: ignore
+Tensor.__sub__    = subtract  #type: ignore
+Tensor.__mul__    = multiply  #type: ignore
+Tensor.__div__    = div       #type: ignore
+Tensor.__pow__    = pow       #type: ignore
+Tensor.__matmul__ = matmul    #type: ignore
+Tensor.reshape    = reshape   #type: ignore
 
 #Mutli-operator functions
 def linear(*args, **kwargs):

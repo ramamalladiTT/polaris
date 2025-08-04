@@ -21,7 +21,7 @@ def create_rn50_params(*, device, dtype):
                 },
             }
 
-    params['layer1'] = [
+    params['layer1'] = [ #type: ignore
             { #0
              'conv1': {
                  'weight': create_ttnn_tensor(shape=[64, 64, 1, 1]),
@@ -72,7 +72,7 @@ def create_rn50_params(*, device, dtype):
               },
              ]
 
-    params['layer2'] = [
+    params['layer2'] = [ #type: ignore
             { #0
              'conv1': {
                  'weight': create_ttnn_tensor(shape=[128, 256, 1, 1]),
@@ -136,7 +136,7 @@ def create_rn50_params(*, device, dtype):
              },
             ]
 
-    params['layer3'] = [
+    params['layer3'] = [ #type: ignore
             { #0
              'conv1': {
                  'weight': create_ttnn_tensor(shape=[256, 512, 1, 1]),
@@ -227,7 +227,7 @@ def create_rn50_params(*, device, dtype):
              },
             ]
 
-    params['layer4'] = [
+    params['layer4'] = [ #type: ignore
             { #0
              'conv1': {
                  'weight': create_ttnn_tensor(shape=[512, 1024, 1, 1]),
@@ -279,6 +279,7 @@ def create_rn50_params(*, device, dtype):
 
 ############################x############################x############################x############################
 def get_core_grid_from_num_cores(num_cores: int, grid_rows: int, grid_cols: int):
+    """
     columns = num_cores // grid_rows
     assert columns <= grid_cols, "Not enough cores for specified core grid"
     ranges = []
@@ -299,6 +300,8 @@ def get_core_grid_from_num_cores(num_cores: int, grid_rows: int, grid_cols: int)
             )
         )
     return ttnn.CoreRangeSet({*ranges})
+    """
+    raise NotImplementedError('get_core_grid_from_num_cores not implemented yet')
 
 def find_closest_largest_divisor(num: int, start_divisor: int) -> int:
     divisor = start_divisor
@@ -311,7 +314,6 @@ def find_closest_largest_divisor(num: int, start_divisor: int) -> int:
 # This will avoid default conv codepath which can pad-up the nhw num tiles and produce padded output
 # This can lead to issues with data-movment ops not handling padding correctly
 def get_conv_input_memory_config(
-
         batch_size              : int,
         input_channels          : int,
         input_height            : int,
@@ -319,7 +321,7 @@ def get_conv_input_memory_config(
         output_channels         : int,
         output_height           : int,
         output_width            : int,
-        compute_grid            : ttnn.CoreGrid,
+        compute_grid            : tuple[int, int],#ttnn.CoreGrid,
         input_channels_alignment: int,
         override_num_cores      : bool,
 
@@ -353,7 +355,7 @@ def get_conv_input_memory_config(
             )
     return memory_config
     """
-    return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+    return ttnn.MemoryConfig.L1 #L1_WIDTH_SHARDED_MEMORY_CONFIG
 
 
 def _nearest_y(x, y): return math.ceil(x / y) * y
@@ -367,7 +369,6 @@ def is_blackhole():
 def is_wormhole_b0():
     ARCH_NAME = ttnn.get_arch_name()
     return "wormhole_b0" in ARCH_NAME
-
 
 def is_grayskull():
     ARCH_NAME = ttnn.get_arch_name()

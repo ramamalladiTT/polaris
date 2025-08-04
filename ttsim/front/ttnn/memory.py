@@ -31,5 +31,5 @@ def create_sharded_memory_config(shape,
         if False, the shard shape will be calculated based on the core_grid and the tensor shape where tensor shape = [math.prod(dims), width]
         Defaults to False
     """
-    pass
+    return MemoryConfig.L1
 
