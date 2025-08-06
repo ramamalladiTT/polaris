@@ -67,3 +67,17 @@ def init_device_compute_kernel_config(
                                                            packer_l1_acc),
             }[dev_arch]
 
+class MatmulMultiCoreReuseMultiCast1DProgramConfig:
+
+    def __init__(self, **kwargs):
+        self.compute_with_storage_grid_size = kwargs.get('compute_with_storage_grid_size', (8, 8)),
+        self.in0_block_w                    = kwargs.get('in0_block_w',                    1),
+        self.out_subblock_h                 = kwargs.get('out_subblock_h',                 1),
+        self.out_subblock_w                 = kwargs.get('out_subblock_w',                 1),
+        self.per_core_M                     = kwargs.get('per_core_M',                     1),
+        self.per_core_N                     = kwargs.get('per_core_N',                     1),
+        self.fuse_batch                     = kwargs.get('fuse_batch',                     True),
+        self.fused_activation               = kwargs.get('fused_activation',               None),
+        self.mcast_in0                      = kwargs.get('mcast_in0',                      True),
+        return
+
