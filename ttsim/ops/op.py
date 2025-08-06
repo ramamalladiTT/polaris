@@ -2505,9 +2505,8 @@ class ArgMaxMinOp(SimOp):
                 'inElems' : dataT.nelems(),
                 'inBytes' : dataT.nbytes(),
                 'outElems': outT[0].nelems(),
-                'outBytes': outT[0].nbytes(),
+                'outBytes': outT[0].nbytes(self.precision),
                 'instrs'  : {'cmp': dataT.nelems()}
->>>>>>> e7158e5 (support for ttnn mlp_inference example)
                 }
 
         return self.perf_stats

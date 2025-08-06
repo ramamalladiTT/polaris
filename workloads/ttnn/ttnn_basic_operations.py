@@ -11,6 +11,8 @@ import ttsim.front.ttnn as ttnn
 import numpy as np
 from loguru import logger
 
+def filter_ttnn_attrs(attrs_dict):
+    return {k: v for k, v in attrs_dict.items() if not isinstance(v, ttnn.MemoryConfig)}
 
 def main():
     # Open Tenstorrent device
@@ -23,7 +25,7 @@ def main():
 
         logger.info("\n--- TT-NN Tensor Creation with Tiles (32x32) ---")
         #host_rand = torch.rand((32, 32), dtype=torch.float32)
-        host_rand = ttnn._rand((32, 32), dtype=ttnn.float32)
+        host_rand = ttnn._rand((32, 32), dtype=ttnn.float32, device=device)
 
         tt_t1 = ttnn.full(
             shape=(32, 32),
@@ -80,7 +82,8 @@ def main():
 
         #check graph via onnx dump
         g = device.get_graph()
-        g.graph2onnx('ttnn_basic_operations.onnx', do_model_check=False)
+        g.graph2onnx('ttnn_basic_operations.onnx', do_model_check=False,
+                     filter_op_attrs=filter_ttnn_attrs)
         #model check = False for graph2onnx because memory_config is not a valid ONNX attribute
 
 
