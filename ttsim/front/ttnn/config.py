@@ -24,6 +24,7 @@ class Conv2dConfig:
     enable_split_reader             : bool = False
     enable_subblock_padding         : bool = False
     in_place                        : bool = False
+    full_inner_dim                  : bool = False
     enable_kernel_stride_folding    : bool = False
     act_block_h_override            : int  = 0
     act_block_w_div                 : int  = 1

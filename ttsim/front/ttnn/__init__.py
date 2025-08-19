@@ -7,10 +7,10 @@ from .tensor import _rand, full, zeros, ones, from_torch, to_torch, to_layout, t
 from .tensor import Layout, Shape
 from .config import Conv2dConfig, WormholeComputeKernelConfig, init_device_compute_kernel_config
 from .config import MatmulMultiCoreReuseMultiCast1DProgramConfig
-from .buffer import TensorMemoryLayout
-from .memory import MemoryConfig
+from .buffer import TensorMemoryLayout, ShardOrientation, BufferType
+from .memory import MemoryConfig, create_sharded_memory_config_, to_memory_config, get_memory_config
+from .core   import CoreCoord, CoreRange, CoreRangeSet, CoreGrid
 from .op     import *
-
 
 float32  = DataType.FLOAT32
 bfloat16 = DataType.BFLOAT16
@@ -30,6 +30,19 @@ L1_WIDTH_SHARDED_MEMORY_CONFIG = 0
 def get_arch_name():
     return ARCH.WORMHOLE_B0.cname
 
-CoreGrid = 1
-#TODO: Need to add these...
-# CoreRangeSet, CoreRange
+def is_tensor_storage_on_device(ttnn_tensor_like):
+    return True
+
+def prepare_conv_weights(weight_tensor, weights_format, input_memory_config, input_layout,
+                         has_bias, input_dtype, **kwargs):
+    return weight_tensor
+
+def prepare_conv_bias(bias_tensor, input_memory_config, input_layout, input_dtype, **kwargs,):
+    return bias_tensor
+
+
+def deallocate(x): pass
+def reallocate(x): return x
+
+def untilize_with_unpadding(x, *args, **kwargs): return x
+def tilize_with_val_padding(x, *args, **kwargs): return x

@@ -16,6 +16,7 @@ class MemoryConfig(Enum):
     def cname(self)->str:
         return self.name.lower()
 
+#placeholders
 def create_sharded_memory_config(shape,
                                  core_grid,
                                  strategy,#: ShardStrategy,
@@ -31,5 +32,14 @@ def create_sharded_memory_config(shape,
         if False, the shard shape will be calculated based on the core_grid and the tensor shape where tensor shape = [math.prod(dims), width]
         Defaults to False
     """
+    return MemoryConfig.L1
+
+def create_sharded_memory_config_(shape, grid, mem_layout, orientation, tile_layout):
+    return MemoryConfig.L1
+
+def to_memory_config(x, downsample):
+    return x
+
+def get_memory_config(x):
     return MemoryConfig.L1
 

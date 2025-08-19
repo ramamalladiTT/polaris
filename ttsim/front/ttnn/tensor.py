@@ -276,8 +276,10 @@ def from_torch(torch_tensor_like, **kwargs):
 def to_torch(tt_tensor_like):
     return tt_tensor_like
 
-def to_layout(tt_tensor_like, layout):
+def to_layout(tt_tensor_like, layout, dtype=None):
     tt_tensor_like.layout = layout
+    if dtype is not None:
+        tt_tensor_like.dtype = dtype
     return tt_tensor_like
 
 def to_device(tt_tensor_like, device):

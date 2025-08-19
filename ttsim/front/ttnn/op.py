@@ -229,3 +229,47 @@ def linear(*args, **kwargs):
         C = act_op(C)
     return C
 
+# fold:
+# takes an input tensor with shape (N, H, W, C) and transforms it to shape
+# (N, H//stride_h, W//stride_w, C*stride_h*stride_w) by reshaping and permuting
+# the spatial dimensions. This operation is commonly used as a preprocessing step
+# for convolution operations, similar to the im2col operation in other deep learning
+# frameworks, to reorganize input data in a format suitable for efficient matrix
+# multiplication on Tenstorrent hardware.
+def fold(ttnn_tensor_like,
+         stride_h : int,
+         stride_w : int,
+         *,
+         use_transpose_as_fold = False,
+         output_shape = None, #ttnn.Shape
+         pad_c : int = 0,
+         pad_h : int = 0,
+         pad_w : int = 0,
+         grid_size = None, #ttnn.CoreRangeSet
+         override_memory_config: MemoryConfig = None, #type: ignore
+         ):
+
+    assert ttnn_tensor_like.rank() == 4, f"fold input should be a rank-4 [N, H, W, C] tensor!!\n{ttnn_tensor_like}"
+    N, H, W, C = ttnn_tensor_like.shape
+
+    assert isinstance(stride_h, int) and stride_h > 0 and stride_h <= H, f"stride_h({stride_h}) should be in [0, {H}]"
+    assert isinstance(stride_w, int) and stride_w > 0 and stride_w <= H, f"stride_w({stride_w}) should be in [0, {W}]"
+
+    if pad_h > 0: H += pad_h
+    if pad_w > 0: W += pad_w
+    if pad_c > 0: C += pad_c
+
+    Hs = H // stride_h
+    Ws = W // stride_w
+
+    if use_transpose_as_fold:
+        #fold implemented as a series of reshape/transpose
+        reshaped1  = ttnn_tensor_like.reshape(N, Hs, stride_h, Ws, stride_w, C)
+        transposed = reshaped1.permute(0, 1, 3, 2, 4, 5)
+        reshaped2  = transposed.reshape(N, Hs, Ws, C * stride_h * stride_w)
+    else:
+        #fold implemented as device specific efficient kernel: for DRAM/L1 memory configs
+        #sharded tensor support: special handling for height sharded tensors
+        reshaped2  = ttnn_tensor_like.reshape(N, Hs, Ws, C * stride_h * stride_w)
+
+    return reshaped2
