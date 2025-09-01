@@ -128,6 +128,7 @@ class SimOpHandle:
         #get perf stats for the SimOp -- this also ensures that the output tensor shape/data
         #is well formed
         self.perf_stats = self.sim_op.get_perf_counts(xinput,[self.otensor])
+        print(f'{self.optype}:: {self.perf_stats}')
         self.sim_op.update_tensor_counts(xinput,[self.otensor])
 
         #return result
@@ -515,6 +516,8 @@ Relu          = partial(UnaryOperator, optype='Relu')
 LeakyReLU     = partial(UnaryOperator, optype='LeakyRelu')
 Sigmoid       = partial(UnaryOperator, optype='Sigmoid')
 AveragePool2d = partial(UnaryOperator, optype='AveragePool')
+mean          = partial(UnaryOperator, optype='Mean')
+rsqrt         = partial(UnaryOperator, optype='Rsqrt')
 
 #Binary Operators
 BinaryOperator = partial(UniversalOperator, params=[], ipos=[0,1])
