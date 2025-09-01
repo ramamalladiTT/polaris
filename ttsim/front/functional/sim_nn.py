@@ -18,6 +18,7 @@ class Module:
         self._tensors  = {}
         self._op_hndls = {}
         self._submodules  = {}
+        self.name = "dummy_module"
 
     def __setattr__(self, name, value):
         if isinstance(value, SimTensor):
@@ -189,24 +190,50 @@ class ModuleList:
         for i in range(len(self)):
             yield self[i]
 
-
-
-    #we want to make this immutable after construction...
-    # so restricting setitem / delitem / append / insert / extend
-    def __setitem__(self, idx, module):
-        raise RuntimeError("ModuleList is immutable after construction")
-
-    def __delitem__(self, idx):
-        raise RuntimeError("ModuleList is immutable after construction")
-
     def append(self, module):
-        raise RuntimeError("ModuleList is immutable after construction")
+        assert module is not None, f"'None' module passed to ModuleList"
+        assert isinstance(module, Module), f"{module} is not a Module subclass"
+        idx = str(len(self))
+        self._modules_in_list[idx] = module
 
     def extend(self, modules):
-        raise RuntimeError("ModuleList is immutable after construction")
+        for module in modules:
+            self.append(module)
 
     def insert(self, index, module):
-        raise RuntimeError("ModuleList is immutable after construction")
+        assert module is not None, f"'None' module passed to ModuleList"
+        assert isinstance(module, Module), f"{module} is not a Module subclass"
+        if index < 0:
+            index = max(0, len(self) + index)
+        if index > len(self):
+            index = len(self)
+        # Shift modules to make space
+        for i in range(len(self), index, -1):
+            self._modules_in_list[str(i)] = self._modules_in_list[str(i-1)]
+        self._modules_in_list[str(index)] = module
+
+    def __setitem__(self, idx, module):
+        assert module is not None, f"'None' module passed to ModuleList"
+        assert isinstance(module, Module), f"{module} is not a Module subclass"
+        if isinstance(idx, int):
+            idx = idx + len(self) if idx < 0 else idx
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f'out-of-bound-index: {idx}')
+            self._modules_in_list[str(idx)] = module
+        else:
+            raise TypeError(f'Invalid index Type: {type(idx)}')
+
+    def __delitem__(self, idx):
+        if isinstance(idx, int):
+            idx = idx + len(self) if idx < 0 else idx
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f'out-of-bound-index: {idx}')
+            # Remove the module and shift indices
+            for i in range(idx, len(self)-1):
+                self._modules_in_list[str(i)] = self._modules_in_list[str(i+1)]
+            del self._modules_in_list[str(len(self)-1)]
+        else:
+            raise TypeError(f'Invalid index Type: {type(idx)}')
 
     def __call__(self, *x):
         raise RuntimeError("ModuleList is not Callable")

@@ -1,0 +1,2498 @@
+commit 9aa9e1f9821eeaf75a77b6b34ec7e5db639c3bdb
+Author: Rama Malladi <rmalladi@tenstorrent.com>
+Date:   Thu Aug 21 13:20:06 2025 +0530
+
+    Stable Diffusion porting to Polaris
+
+diff --git a/src/diffusers/models/activations.py b/src/diffusers/models/activations.py
+index 2d1fdb5f7..e3b9fd893 100644
+--- a/src/diffusers/models/activations.py
++++ b/src/diffusers/models/activations.py
+@@ -20,20 +20,25 @@ from torch import nn
+ from ..utils import deprecate
+ from ..utils.import_utils import is_torch_npu_available, is_torch_version
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ 
+ if is_torch_npu_available():
+     import torch_npu
+ 
+ ACT2CLS = {
+-    "swish": nn.SiLU,
+-    "silu": nn.SiLU,
++    "swish": ttsimF.Silu,
++    "silu": ttsimF.Silu,
+     "mish": nn.Mish,
+     "gelu": nn.GELU,
+     "relu": nn.ReLU,
+ }
+ 
+ 
+-def get_activation(act_fn: str) -> nn.Module:
++def get_activation(act_fn: str) -> SimNN.Module:
+     """Helper function to get activation function from string.
+ 
+     Args:
+@@ -45,7 +50,7 @@ def get_activation(act_fn: str) -> nn.Module:
+ 
+     act_fn = act_fn.lower()
+     if act_fn in ACT2CLS:
+-        return ACT2CLS[act_fn]()
++        return ACT2CLS[act_fn]('act_fn')
+     else:
+         raise ValueError(f"activation function {act_fn} not found in ACT2FN mapping {list(ACT2CLS.keys())}")
+ 
+@@ -62,7 +67,7 @@ class FP32SiLU(nn.Module):
+         return F.silu(inputs.float(), inplace=False).to(inputs.dtype)
+ 
+ 
+-class GELU(nn.Module):
++class GELU(SimNN.Module):
+     r"""
+     GELU activation function with tanh approximation support with `approximate="tanh"`.
+ 
+@@ -73,18 +78,21 @@ class GELU(nn.Module):
+         bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
+     """
+ 
+-    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True):
++    def __init__(self, name: str, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True):
+         super().__init__()
+-        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
++        self.name = name
++        self.proj = ttsimF.Linear(f'{self.name}_proj', dim_in, dim_out, bias=bias)
+         self.approximate = approximate
++        super().link_op2module()
+ 
+-    def gelu(self, gate: torch.Tensor) -> torch.Tensor:
+-        if gate.device.type == "mps" and is_torch_version("<", "2.0.0"):
+-            # fp16 gelu not supported on mps before torch 2.0
+-            return F.gelu(gate.to(dtype=torch.float32), approximate=self.approximate).to(dtype=gate.dtype)
+-        return F.gelu(gate, approximate=self.approximate)
++    def gelu(self, gate: SimNN.SimTensor) -> SimNN.SimTensor:
++        # if gate.device.type == "mps" and is_torch_version("<", "2.0.0"):
++        #     # fp16 gelu not supported on mps before torch 2.0
++        #     return F.gelu(gate.to(dtype=torch.float32), approximate=self.approximate).to(dtype=gate.dtype)
++        op = ttsimF.Gelu(f'{self.name}_geluop')
++        return op(gate)
+ 
+-    def forward(self, hidden_states):
++    def __call__(self, hidden_states):
+         hidden_states = self.proj(hidden_states)
+         hidden_states = self.gelu(hidden_states)
+         return hidden_states
+diff --git a/src/diffusers/models/attention.py b/src/diffusers/models/attention.py
+index c720b3795..9bd050019 100644
+--- a/src/diffusers/models/attention.py
++++ b/src/diffusers/models/attention.py
+@@ -18,6 +18,11 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ..utils import deprecate, logging
+ from ..utils.import_utils import is_torch_npu_available, is_torch_xla_available, is_xformers_available
+ from ..utils.torch_utils import maybe_allow_in_graph
+@@ -738,8 +743,8 @@ class JointTransformerBlock(nn.Module):
+         return encoder_hidden_states, hidden_states
+ 
+ 
+-@maybe_allow_in_graph
+-class BasicTransformerBlock(nn.Module):
++# @maybe_allow_in_graph
++class BasicTransformerBlock(SimNN.Module):
+     r"""
+     A basic Transformer block.
+ 
+@@ -776,6 +781,7 @@ class BasicTransformerBlock(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         dim: int,
+         num_attention_heads: int,
+         attention_head_dim: int,
+@@ -801,6 +807,7 @@ class BasicTransformerBlock(nn.Module):
+         attention_out_bias: bool = True,
+     ):
+         super().__init__()
++        self.name = objname
+         self.dim = dim
+         self.num_attention_heads = num_attention_heads
+         self.attention_head_dim = attention_head_dim
+@@ -856,9 +863,10 @@ class BasicTransformerBlock(nn.Module):
+                 "rms_norm",
+             )
+         else:
+-            self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
++            self.norm1 = ttsimF.LayerNorm(f'{self.name}_norm1', dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
+ 
+         self.attn1 = Attention(
++            objname=f"{self.name}_transformer_block_1",
+             query_dim=dim,
+             heads=num_attention_heads,
+             dim_head=attention_head_dim,
+@@ -886,9 +894,10 @@ class BasicTransformerBlock(nn.Module):
+                     "rms_norm",
+                 )
+             else:
+-                self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
++                self.norm2 = ttsimF.LayerNorm(f'{self.name}_norm2', dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
+ 
+             self.attn2 = Attention(
++                objname=f"{self.name}_transformer_block_2",
+                 query_dim=dim,
+                 cross_attention_dim=cross_attention_dim if not double_self_attention else None,
+                 heads=num_attention_heads,
+@@ -900,7 +909,7 @@ class BasicTransformerBlock(nn.Module):
+             )  # is self-attn if encoder_hidden_states is none
+         else:
+             if norm_type == "ada_norm_single":  # For Latte
+-                self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
++                self.norm2 = ttsimF.LayerNorm(f'{self.name}_norm2', dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
+             else:
+                 self.norm2 = None
+             self.attn2 = None
+@@ -917,11 +926,12 @@ class BasicTransformerBlock(nn.Module):
+             )
+ 
+         elif norm_type in ["ada_norm_zero", "ada_norm", "layer_norm"]:
+-            self.norm3 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
++            self.norm3 = ttsimF.LayerNorm(f'{self.name}_norm3', dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
+         elif norm_type == "layer_norm_i2vgen":
+             self.norm3 = None
+ 
+         self.ff = FeedForward(
++            f"{self.name}_transformer_block_ff",
+             dim,
+             dropout=dropout,
+             activation_fn=activation_fn,
+@@ -942,22 +952,24 @@ class BasicTransformerBlock(nn.Module):
+         self._chunk_size = None
+         self._chunk_dim = 0
+ 
++        super().link_op2module()
++
+     def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int = 0):
+         # Sets chunk feed-forward
+         self._chunk_size = chunk_size
+         self._chunk_dim = dim
+ 
+-    def forward(
++    def __call__(
+         self,
+-        hidden_states: torch.Tensor,
+-        attention_mask: Optional[torch.Tensor] = None,
+-        encoder_hidden_states: Optional[torch.Tensor] = None,
+-        encoder_attention_mask: Optional[torch.Tensor] = None,
+-        timestep: Optional[torch.LongTensor] = None,
++        hidden_states: SimNN.SimTensor,
++        attention_mask: Optional[SimNN.SimTensor] = None,
++        encoder_hidden_states: Optional[SimNN.SimTensor] = None,
++        encoder_attention_mask: Optional[SimNN.SimTensor] = None,
++        timestep: Optional[SimNN.SimTensor] = None,
+         cross_attention_kwargs: Dict[str, Any] = None,
+-        class_labels: Optional[torch.LongTensor] = None,
+-        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+-    ) -> torch.Tensor:
++        class_labels: Optional[SimNN.SimTensor] = None,
++        added_cond_kwargs: Optional[Dict[str, SimNN.SimTensor]] = None,
++    ) -> SimNN.SimTensor:
+         if cross_attention_kwargs is not None:
+             if cross_attention_kwargs.get("scale", None) is not None:
+                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
+@@ -1005,7 +1017,7 @@ class BasicTransformerBlock(nn.Module):
+             attn_output = gate_msa * attn_output
+ 
+         hidden_states = attn_output + hidden_states
+-        if hidden_states.ndim == 4:
++        if len(hidden_states.shape) == 4:
+             hidden_states = hidden_states.squeeze(1)
+ 
+         # 1.2 GLIGEN Control
+@@ -1029,7 +1041,6 @@ class BasicTransformerBlock(nn.Module):
+ 
+             if self.pos_embed is not None and self.norm_type != "ada_norm_single":
+                 norm_hidden_states = self.pos_embed(norm_hidden_states)
+-
+             attn_output = self.attn2(
+                 norm_hidden_states,
+                 encoder_hidden_states=encoder_hidden_states,
+@@ -1064,7 +1075,7 @@ class BasicTransformerBlock(nn.Module):
+             ff_output = gate_mlp * ff_output
+ 
+         hidden_states = ff_output + hidden_states
+-        if hidden_states.ndim == 4:
++        if len(hidden_states.shape) == 4:
+             hidden_states = hidden_states.squeeze(1)
+ 
+         return hidden_states
+@@ -1669,7 +1680,7 @@ class FreeNoiseTransformerBlock(nn.Module):
+         return hidden_states
+ 
+ 
+-class FeedForward(nn.Module):
++class FeedForward(SimNN.Module):
+     r"""
+     A feed-forward layer.
+ 
+@@ -1685,6 +1696,7 @@ class FeedForward(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         dim: int,
+         dim_out: Optional[int] = None,
+         mult: int = 4,
+@@ -1698,32 +1710,36 @@ class FeedForward(nn.Module):
+         if inner_dim is None:
+             inner_dim = int(dim * mult)
+         dim_out = dim_out if dim_out is not None else dim
+-
+-        if activation_fn == "gelu":
+-            act_fn = GELU(dim, inner_dim, bias=bias)
+-        if activation_fn == "gelu-approximate":
+-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+-        elif activation_fn == "geglu":
+-            act_fn = GEGLU(dim, inner_dim, bias=bias)
+-        elif activation_fn == "geglu-approximate":
+-            act_fn = ApproximateGELU(dim, inner_dim, bias=bias)
+-        elif activation_fn == "swiglu":
+-            act_fn = SwiGLU(dim, inner_dim, bias=bias)
+-        elif activation_fn == "linear-silu":
+-            act_fn = LinearActivation(dim, inner_dim, bias=bias, activation="silu")
+-
+-        self.net = nn.ModuleList([])
++        self.name = objname
++
++        act_fn = GELU(f'{self.name}_geluop1', dim, inner_dim, bias=bias) ## approximate this with GELU for now
++
++        # if activation_fn == "gelu":
++        #     act_fn = GELU(dim, inner_dim, bias=bias)
++        # if activation_fn == "gelu-approximate":
++        #     act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
++        # elif activation_fn == "geglu":
++        #     act_fn = GELU(f'{self.name}_geluop1', dim, inner_dim, bias=bias) ## approximate this with GELU for now
++        # elif activation_fn == "geglu-approximate":
++        #     act_fn = ApproximateGELU(dim, inner_dim, bias=bias)
++        # elif activation_fn == "swiglu":
++        #     act_fn = SwiGLU(dim, inner_dim, bias=bias)
++        # elif activation_fn == "linear-silu":
++        #     act_fn = LinearActivation(dim, inner_dim, bias=bias, activation="silu")
++
++        # self.net = nn.ModuleList([])
+         # project in
+-        self.net.append(act_fn)
++        self.net = [act_fn]
+         # project dropout
+-        self.net.append(nn.Dropout(dropout))
++        # self.net.append(SimNN.Dropout(dropout)) ## ignoring dropout
+         # project out
+-        self.net.append(nn.Linear(inner_dim, dim_out, bias=bias))
++        self.net.append(ttsimF.Linear(f'{self.name}_linop', inner_dim, dim_out, bias=bias))
+         # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
+         if final_dropout:
+-            self.net.append(nn.Dropout(dropout))
++            self.net.append(SimNN.Dropout(dropout))
++        super().link_op2module()
+ 
+-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
++    def __call__(self, hidden_states: SimNN.SimTensor, *args, **kwargs) -> SimNN.SimTensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+diff --git a/src/diffusers/models/attention_processor.py b/src/diffusers/models/attention_processor.py
+index 990245de1..72b4a3168 100755
+--- a/src/diffusers/models/attention_processor.py
++++ b/src/diffusers/models/attention_processor.py
+@@ -13,12 +13,18 @@
+ # limitations under the License.
+ import inspect
+ import math
++from turtle import width
+ from typing import Callable, List, Optional, Tuple, Union
+ 
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ..image_processor import IPAdapterMaskProcessor
+ from ..utils import deprecate, is_torch_xla_available, logging
+ from ..utils.import_utils import is_torch_npu_available, is_torch_xla_version, is_xformers_available
+@@ -46,8 +52,8 @@ else:
+     XLA_AVAILABLE = False
+ 
+ 
+-@maybe_allow_in_graph
+-class Attention(nn.Module):
++# @maybe_allow_in_graph
++class Attention(SimNN.Module):
+     r"""
+     A cross attention layer.
+ 
+@@ -104,6 +110,7 @@ class Attention(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         query_dim: int,
+         cross_attention_dim: Optional[int] = None,
+         heads: int = 8,
+@@ -140,6 +147,7 @@ class Attention(nn.Module):
+         # To prevent circular import.
+         from .normalization import FP32LayerNorm, LpNorm, RMSNorm
+ 
++        self.name = objname
+         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
+         self.inner_kv_dim = self.inner_dim if kv_heads is None else dim_head * kv_heads
+         self.query_dim = query_dim
+@@ -180,12 +188,12 @@ class Attention(nn.Module):
+             )
+ 
+         if norm_num_groups is not None:
+-            self.group_norm = nn.GroupNorm(num_channels=query_dim, num_groups=norm_num_groups, eps=eps, affine=True)
++            self.group_norm = ttsimF.GroupNorm(f"{self.name}_grpnrm", num_channels=query_dim, num_groups=norm_num_groups, eps=eps, affine=True)
+         else:
+             self.group_norm = None
+ 
+         if spatial_norm_dim is not None:
+-            self.spatial_norm = SpatialNorm(f_channels=query_dim, zq_channels=spatial_norm_dim)
++            self.spatial_norm = SpatialNorm(f"{self.name}_spatial_norm", f_channels=query_dim, zq_channels=spatial_norm_dim)
+         else:
+             self.spatial_norm = None
+ 
+@@ -240,12 +248,12 @@ class Attention(nn.Module):
+                 f"unknown cross_attention_norm: {cross_attention_norm}. Should be None, 'layer_norm' or 'group_norm'"
+             )
+ 
+-        self.to_q = nn.Linear(query_dim, self.inner_dim, bias=bias)
++        self.to_q = ttsimF.Linear(f"{self.name}_linearop1", query_dim, self.inner_dim, bias=bias)
+ 
+         if not self.only_cross_attention:
+             # only relevant for the `AddedKVProcessor` classes
+-            self.to_k = nn.Linear(self.cross_attention_dim, self.inner_kv_dim, bias=bias)
+-            self.to_v = nn.Linear(self.cross_attention_dim, self.inner_kv_dim, bias=bias)
++            self.to_k = ttsimF.Linear(f"{self.name}_linearop2", self.cross_attention_dim, self.inner_kv_dim, bias=bias)
++            self.to_v = ttsimF.Linear(f"{self.name}_linearop3", self.cross_attention_dim, self.inner_kv_dim, bias=bias)
+         else:
+             self.to_k = None
+             self.to_v = None
+@@ -261,10 +269,16 @@ class Attention(nn.Module):
+             self.add_k_proj = None
+             self.add_v_proj = None
+ 
++        super().link_op2module()
++
+         if not self.pre_only:
+-            self.to_out = nn.ModuleList([])
+-            self.to_out.append(nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
+-            self.to_out.append(nn.Dropout(dropout))
++            # self.to_out = nn.ModuleList([])
++            linop1 = ttsimF.Linear(f"{self.name}_linoper1", self.inner_dim, self.out_dim, bias=out_bias)
++            linop1.set_module(SimNN.Module())
++            self.to_out = [linop1]
++            dpoutop = ttsimF.Dropout(f"{self.name}_dropoutop", dropout)
++            dpoutop.set_module(SimNN.Module())
++            self.to_out.append(dpoutop)
+         else:
+             self.to_out = None
+ 
+@@ -300,6 +314,7 @@ class Attention(nn.Module):
+         # We use the AttnProcessor2_0 by default when torch 2.x is used which uses
+         # torch.nn.functional.scaled_dot_product_attention for native Flash/memory_efficient_attention
+         # but only if it has the default `scale` argument. TODO remove scale_qk check when we move to torch 2.1
++
+         if processor is None:
+             processor = (
+                 AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
+@@ -564,13 +579,13 @@ class Attention(nn.Module):
+         if not return_deprecated_lora:
+             return self.processor
+ 
+-    def forward(
++    def __call__(
+         self,
+-        hidden_states: torch.Tensor,
+-        encoder_hidden_states: Optional[torch.Tensor] = None,
+-        attention_mask: Optional[torch.Tensor] = None,
++        hidden_states: SimNN.SimTensor,
++        encoder_hidden_states: Optional[SimNN.SimTensor] = None,
++        attention_mask: Optional[SimNN.SimTensor] = None,
+         **cross_attention_kwargs,
+-    ) -> torch.Tensor:
++    ) -> SimNN.SimTensor:
+         r"""
+         The forward method of the `Attention` class.
+ 
+@@ -2691,25 +2706,58 @@ class AttnProcessorNPU:
+         return hidden_states
+ 
+ 
+-class AttnProcessor2_0:
++class AttnProcessor2_0(SimNN.Module):
+     r"""
+     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
+     """
+ 
+     def __init__(self):
++        super().__init__()
++        self.name = "AttnProcessor2_0"
+         if not hasattr(F, "scaled_dot_product_attention"):
+             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
++        self.bmmop1 = ttsimF.bmm(f'{self.name}_bmmop1')
++        self.bmmop2 = ttsimF.bmm(f'{self.name}_bmmop2')
++        self.transpose_op = ttsimF.Transpose(f'{self.name}_transpose_op', perm=(0, 2, 1))
++        self.softmaxop = ttsimF.Softmax(f'{self.name}_softmaxop')
++        self.transpose_op2 = ttsimF.Transpose(f'{self.name}_transpose_op2', perm=(0, 2, 1, 3))
++        self.transpose_op3 = ttsimF.Transpose(f'{self.name}_transpose_op3', perm=(0, 2, 1, 3))
++        self.transpose_op4 = ttsimF.Transpose(f'{self.name}_transpose_op4', perm=(0, 2, 1, 3))
++        self.transpose_op5 = ttsimF.Transpose(f'{self.name}_transpose_op5', perm=(0, 2, 1, 3))
++        super().link_op2module()
++
++    def scaled_dot_product_attention(
++            self, query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
++    ):
++        # Simulate torch.nn.functional.scaled_dot_product_attention using ttsimF
++        # Assumes query, key, value are SimNN.SimTensor
++        # attn_mask is ignored for now (can be added if needed)
++        # dropout_p and is_causal are ignored for now
++
++        # Compute attention scores
++        # scale = 1.0 / (query.shape[-1] ** 0.5)
++        # scale = ttsimF._from_shape('scale', query.shape)
++        attn_scores = self.bmmop1(query, key.transpose(-1, -2)) # * scale
++        scale = ttsimF._from_shape(f'{self.name}_scale', attn_scores.shape)
++        attn_scores = attn_scores * scale
++
++        if attn_mask is not None:
++            attn_scores = attn_scores + attn_mask
++
++        attn_probs = self.softmaxop(attn_scores)
++        attn_output = self.bmmop2(attn_probs, value)
++        return attn_output
+ 
+     def __call__(
+         self,
+         attn: Attention,
+-        hidden_states: torch.Tensor,
+-        encoder_hidden_states: Optional[torch.Tensor] = None,
+-        attention_mask: Optional[torch.Tensor] = None,
+-        temb: Optional[torch.Tensor] = None,
++        hidden_states: SimNN.SimTensor,
++        encoder_hidden_states: Optional[SimNN.SimTensor] = None,
++        attention_mask: Optional[SimNN.SimTensor] = None,
++        temb: Optional[SimNN.SimTensor] = None,
+         *args,
+         **kwargs,
+-    ) -> torch.Tensor:
++    ) -> SimNN.SimTensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -2718,15 +2766,16 @@ class AttnProcessor2_0:
+         if attn.spatial_norm is not None:
+             hidden_states = attn.spatial_norm(hidden_states, temb)
+ 
+-        input_ndim = hidden_states.ndim
++        # input_ndim = hidden_states.ndim
++        input_ndim = len(hidden_states.shape) if isinstance(hidden_states, SimNN.SimTensor) else hidden_states.ndim
+ 
+         if input_ndim == 4:
+             batch_size, channel, height, width = hidden_states.shape
+-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
++            hidden_states = hidden_states.view(batch_size, channel, height * width)
++            #hidden_states = hidden_states.transpose(0, 2, 1)
++            hidden_states = self.transpose_op(hidden_states)
+ 
+-        batch_size, sequence_length, _ = (
+-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+-        )
++        batch_size, sequence_length, _ = hidden_states.shape # if encoder_hidden_states is None else encoder_hidden_states.shape
+ 
+         if attention_mask is not None:
+             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+@@ -2750,10 +2799,13 @@ class AttnProcessor2_0:
+         inner_dim = key.shape[-1]
+         head_dim = inner_dim // attn.heads
+ 
+-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++        query = query.view(batch_size, -1, attn.heads, head_dim)
++        query = self.transpose_op3(query)
+ 
+-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++        key = key.view(batch_size, -1, attn.heads, head_dim)
++        key = self.transpose_op4(key)
++        value = value.view(batch_size, -1, attn.heads, head_dim)
++        value = self.transpose_op5(value)
+ 
+         if attn.norm_q is not None:
+             query = attn.norm_q(query)
+@@ -2762,12 +2814,13 @@ class AttnProcessor2_0:
+ 
+         # the output of sdp = (batch, num_heads, seq_len, head_dim)
+         # TODO: add support for attn.scale when we move to Torch 2.1
+-        hidden_states = F.scaled_dot_product_attention(
++        hidden_states = self.scaled_dot_product_attention(
+             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+         )
+ 
+-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+-        hidden_states = hidden_states.to(query.dtype)
++        hidden_states = self.transpose_op2(hidden_states)
++        hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
++        # hidden_states = hidden_states.to(query.dtype)
+ 
+         # linear proj
+         hidden_states = attn.to_out[0](hidden_states)
+@@ -2775,12 +2828,14 @@ class AttnProcessor2_0:
+         hidden_states = attn.to_out[1](hidden_states)
+ 
+         if input_ndim == 4:
+-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
++            hidden_states = hidden_states.transpose(-1, -2)
++            hidden_states = hidden_states.reshape(batch_size, channel, height, width)
+ 
+         if attn.residual_connection:
+             hidden_states = hidden_states + residual
+ 
+-        hidden_states = hidden_states / attn.rescale_output_factor
++        attn_res_factor = ttsimF._from_shape(f'{self.name}_attn_res_factor', hidden_states.shape)
++        hidden_states = hidden_states / attn_res_factor # attn.rescale_output_factor
+ 
+         return hidden_states
+ 
+diff --git a/src/diffusers/models/autoencoders/autoencoder_kl.py b/src/diffusers/models/autoencoders/autoencoder_kl.py
+index 9a4375a36..a83bd5f3e 100644
+--- a/src/diffusers/models/autoencoders/autoencoder_kl.py
++++ b/src/diffusers/models/autoencoders/autoencoder_kl.py
+@@ -15,6 +15,10 @@ from typing import Dict, Optional, Tuple, Union
+ 
+ import torch
+ import torch.nn as nn
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as F
++import ttsim.front.functional.sim_nn as SimNN
+ 
+ from ...configuration_utils import ConfigMixin, register_to_config
+ from ...loaders import PeftAdapterMixin
+@@ -35,7 +39,7 @@ from ..modeling_utils import ModelMixin
+ from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
+ 
+ 
+-class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):
++class AutoencoderKL(SimNN.Module, ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):
+     r"""
+     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
+ 
+@@ -99,6 +103,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+ 
+         # pass init params to Encoder
+         self.encoder = Encoder(
++            objname="encoder",
+             in_channels=in_channels,
+             out_channels=latent_channels,
+             down_block_types=down_block_types,
+@@ -112,6 +117,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+ 
+         # pass init params to Decoder
+         self.decoder = Decoder(
++            objname="decoder",
+             in_channels=latent_channels,
+             out_channels=out_channels,
+             up_block_types=up_block_types,
+@@ -122,8 +128,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+             mid_block_add_attention=mid_block_add_attention,
+         )
+ 
+-        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1) if use_quant_conv else None
+-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1) if use_post_quant_conv else None
++        self.quant_conv = F.Conv2d('conv1', 2 * latent_channels, 2 * latent_channels, 1) if use_quant_conv else None
++        self.post_quant_conv = F.Conv2d('conv2', latent_channels, latent_channels, 1) if use_post_quant_conv else None
+ 
+         self.use_slicing = False
+         self.use_tiling = False
+@@ -137,6 +143,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+         )
+         self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
+         self.tile_overlap_factor = 0.25
++        super().link_op2module()
+ 
+     def enable_tiling(self, use_tiling: bool = True):
+         r"""
+@@ -284,7 +291,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+ 
+         return AutoencoderKLOutput(latent_dist=posterior)
+ 
+-    def _decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
++    def _decode(self, z: SimNN.SimTensor, return_dict: bool = True) -> Union[DecoderOutput, SimNN.SimTensor]:
+         if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size):
+             return self.tiled_decode(z, return_dict=return_dict)
+ 
+@@ -298,10 +305,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+ 
+         return DecoderOutput(sample=dec)
+ 
+-    @apply_forward_hook
++    # @apply_forward_hook
+     def decode(
+-        self, z: torch.FloatTensor, return_dict: bool = True, generator=None
+-    ) -> Union[DecoderOutput, torch.FloatTensor]:
++        self, z: SimNN.SimTensor, return_dict: bool = True, generator=None
++    ) -> Union[DecoderOutput, SimNN.SimTensor]:
+         """
+         Decode a batch of images.
+ 
+@@ -498,13 +505,13 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapter
+ 
+         return DecoderOutput(sample=dec)
+ 
+-    def forward(
++    def __call__(
+         self,
+-        sample: torch.Tensor,
++        sample: SimNN.SimTensor,
+         sample_posterior: bool = False,
+         return_dict: bool = True,
+         generator: Optional[torch.Generator] = None,
+-    ) -> Union[DecoderOutput, torch.Tensor]:
++    ) -> Union[DecoderOutput, SimNN.SimTensor]:
+         r"""
+         Args:
+             sample (`torch.Tensor`): Input sample.
+diff --git a/src/diffusers/models/autoencoders/vae.py b/src/diffusers/models/autoencoders/vae.py
+index 1d74d4f47..2ec794961 100644
+--- a/src/diffusers/models/autoencoders/vae.py
++++ b/src/diffusers/models/autoencoders/vae.py
+@@ -18,6 +18,11 @@ import numpy as np
+ import torch
+ import torch.nn as nn
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as F
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ...utils import BaseOutput
+ from ...utils.torch_utils import randn_tensor
+ from ..activations import get_activation
+@@ -29,7 +34,6 @@ from ..unets.unet_2d_blocks import (
+     get_up_block,
+ )
+ 
+-
+ @dataclass
+ class EncoderOutput(BaseOutput):
+     r"""
+@@ -53,11 +57,11 @@ class DecoderOutput(BaseOutput):
+             The decoded output sample from the last layer of the model.
+     """
+ 
+-    sample: torch.Tensor
+-    commit_loss: Optional[torch.FloatTensor] = None
++    sample: SimNN.SimTensor
++    commit_loss: Optional[SimNN.SimTensor] = None
+ 
+ 
+-class Encoder(nn.Module):
++class Encoder(SimNN.Module):
+     r"""
+     The `Encoder` layer of a variational autoencoder that encodes its input into a latent representation.
+ 
+@@ -83,6 +87,7 @@ class Encoder(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str = "encoder",
+         in_channels: int = 3,
+         out_channels: int = 3,
+         down_block_types: Tuple[str, ...] = ("DownEncoderBlock2D",),
+@@ -96,7 +101,8 @@ class Encoder(nn.Module):
+         super().__init__()
+         self.layers_per_block = layers_per_block
+ 
+-        self.conv_in = nn.Conv2d(
++        self.conv_in = F.Conv2d(
++            objname + ".conv_in",
+             in_channels,
+             block_out_channels[0],
+             kernel_size=3,
+@@ -104,7 +110,7 @@ class Encoder(nn.Module):
+             padding=1,
+         )
+ 
+-        self.down_blocks = nn.ModuleList([])
++        self.name = objname
+ 
+         # down
+         output_channel = block_out_channels[0]
+@@ -126,10 +132,14 @@ class Encoder(nn.Module):
+                 attention_head_dim=output_channel,
+                 temb_channels=None,
+             )
+-            self.down_blocks.append(down_block)
++            if (i == 0):
++                self.down_blocks = SimNN.ModuleList([down_block])
++            else:
++                self.down_blocks.append(down_block)
+ 
+         # mid
+         self.mid_block = UNetMidBlock2D(
++            objname="mid_block",
+             in_channels=block_out_channels[-1],
+             resnet_eps=1e-6,
+             resnet_act_fn=act_fn,
+@@ -150,6 +160,8 @@ class Encoder(nn.Module):
+ 
+         self.gradient_checkpointing = False
+ 
++        super().link_op2module()
++
+     def forward(self, sample: torch.Tensor) -> torch.Tensor:
+         r"""The forward method of the `Encoder` class."""
+ 
+@@ -178,7 +190,7 @@ class Encoder(nn.Module):
+         return sample
+ 
+ 
+-class Decoder(nn.Module):
++class Decoder(SimNN.Module):
+     r"""
+     The `Decoder` layer of a variational autoencoder that decodes its latent representation into an output sample.
+ 
+@@ -203,6 +215,7 @@ class Decoder(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int = 3,
+         out_channels: int = 3,
+         up_block_types: Tuple[str, ...] = ("UpDecoderBlock2D",),
+@@ -215,8 +228,9 @@ class Decoder(nn.Module):
+     ):
+         super().__init__()
+         self.layers_per_block = layers_per_block
+-
+-        self.conv_in = nn.Conv2d(
++        self.name = objname
++        self.conv_in = F.Conv2d(
++            'conv_in_decoder',
+             in_channels,
+             block_out_channels[-1],
+             kernel_size=3,
+@@ -224,12 +238,13 @@ class Decoder(nn.Module):
+             padding=1,
+         )
+ 
+-        self.up_blocks = nn.ModuleList([])
++        # self.up_blocks = nn.ModuleList([])
+ 
+         temb_channels = in_channels if norm_type == "spatial" else None
+ 
+         # mid
+         self.mid_block = UNetMidBlock2D(
++            objname="mid_block",
+             in_channels=block_out_channels[-1],
+             resnet_eps=1e-6,
+             resnet_act_fn=act_fn,
+@@ -264,29 +279,33 @@ class Decoder(nn.Module):
+                 temb_channels=temb_channels,
+                 resnet_time_scale_shift=norm_type,
+             )
+-            self.up_blocks.append(up_block)
++            if (i == 0):
++                self.up_blocks = SimNN.ModuleList([up_block])
++            else:
++                self.up_blocks.append(up_block)
+             prev_output_channel = output_channel
+ 
+         # out
+         if norm_type == "spatial":
+             self.conv_norm_out = SpatialNorm(block_out_channels[0], temb_channels)
+         else:
+-            self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
+-        self.conv_act = nn.SiLU()
+-        self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1)
++            self.conv_norm_out = F.GroupNorm("grp_nrm", num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
++        self.conv_act = F.Silu("silu_op")
++        self.conv_out = F.Conv2d("cpnv2d", block_out_channels[0], out_channels, 3, padding=1)
+ 
+         self.gradient_checkpointing = False
++        super().link_op2module()
+ 
+-    def forward(
++    def __call__(
+         self,
+-        sample: torch.Tensor,
+-        latent_embeds: Optional[torch.Tensor] = None,
+-    ) -> torch.Tensor:
++        sample: SimNN.SimTensor,
++        latent_embeds: Optional[SimNN.SimTensor] = None,
++    ) -> SimNN.SimTensor:
+         r"""The forward method of the `Decoder` class."""
+ 
+         sample = self.conv_in(sample)
+ 
+-        upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
++        upscale_dtype = float # next(iter(self.up_blocks.parameters())).dtype
+         if torch.is_grad_enabled() and self.gradient_checkpointing:
+             # middle
+             sample = self._gradient_checkpointing_func(self.mid_block, sample, latent_embeds)
+@@ -297,11 +316,13 @@ class Decoder(nn.Module):
+                 sample = self._gradient_checkpointing_func(up_block, sample, latent_embeds)
+         else:
+             # middle
++            # print("empty") if latent_embeds is None else print("not empty")
+             sample = self.mid_block(sample, latent_embeds)
+-            sample = sample.to(upscale_dtype)
++            # sample = sample.to(upscale_dtype)
+ 
+             # up
+             for up_block in self.up_blocks:
++                # print(f'sample shape is {sample.shape}')
+                 sample = up_block(sample, latent_embeds)
+ 
+         # post-process
+diff --git a/src/diffusers/models/downsampling.py b/src/diffusers/models/downsampling.py
+index 505816422..235dbfc18 100644
+--- a/src/diffusers/models/downsampling.py
++++ b/src/diffusers/models/downsampling.py
+@@ -18,6 +18,11 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ..utils import deprecate
+ from .normalization import RMSNorm
+ from .upsampling import upfirdn2d_native
+@@ -66,7 +71,7 @@ class Downsample1D(nn.Module):
+         return self.conv(inputs)
+ 
+ 
+-class Downsample2D(nn.Module):
++class Downsample2D(SimNN.Module):
+     """A 2D downsampling layer with an optional convolution.
+ 
+     Parameters:
+@@ -84,6 +89,7 @@ class Downsample2D(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         channels: int,
+         use_conv: bool = False,
+         out_channels: Optional[int] = None,
+@@ -101,10 +107,10 @@ class Downsample2D(nn.Module):
+         self.use_conv = use_conv
+         self.padding = padding
+         stride = 2
+-        self.name = name
++        self.name = objname
+ 
+         if norm_type == "ln_norm":
+-            self.norm = nn.LayerNorm(channels, eps, elementwise_affine)
++            self.norm = ttsimF.LayerNorm(f'{self.name}_layernorm1', channels, eps, elementwise_affine)
+         elif norm_type == "rms_norm":
+             self.norm = RMSNorm(channels, eps, elementwise_affine)
+         elif norm_type is None:
+@@ -113,7 +119,7 @@ class Downsample2D(nn.Module):
+             raise ValueError(f"unknown norm_type: {norm_type}")
+ 
+         if use_conv:
+-            conv = nn.Conv2d(
++            conv = ttsimF.Conv2d(f'{self.name}_conv',
+                 self.channels, self.out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias
+             )
+         else:
+@@ -129,7 +135,9 @@ class Downsample2D(nn.Module):
+         else:
+             self.conv = conv
+ 
+-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
++        super().link_op2module()
++
++    def __call__(self, hidden_states: SimNN.SimTensor, *args, **kwargs) -> SimNN.SimTensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+diff --git a/src/diffusers/models/embeddings.py b/src/diffusers/models/embeddings.py
+index b51f5d7ae..dbf352ac8 100644
+--- a/src/diffusers/models/embeddings.py
++++ b/src/diffusers/models/embeddings.py
+@@ -19,19 +19,24 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ..utils import deprecate
+ from .activations import FP32SiLU, get_activation
+ from .attention_processor import Attention
+ 
+ 
+ def get_timestep_embedding(
+-    timesteps: torch.Tensor,
++    timesteps: SimNN.SimTensor,
+     embedding_dim: int,
+     flip_sin_to_cos: bool = False,
+     downscale_freq_shift: float = 1,
+     scale: float = 1,
+     max_period: int = 10000,
+-) -> torch.Tensor:
++) -> SimNN.SimTensor:
+     """
+     This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
+ 
+@@ -75,7 +80,9 @@ def get_timestep_embedding(
+     # zero pad
+     if embedding_dim % 2 == 1:
+         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+-    return emb
++
++    # torch dependency in this function. need to remove it.
++    return ttsimF._from_shape('timestep_embedding', emb.shape, np_dtype=np.float32, is_param=False)
+ 
+ 
+ def get_3d_sincos_pos_embed(
+@@ -1251,9 +1258,10 @@ def apply_rotary_emb_allegro(x: torch.Tensor, freqs_cis, positions):
+     return x
+ 
+ 
+-class TimestepEmbedding(nn.Module):
++class TimestepEmbedding(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         time_embed_dim: int,
+         act_fn: str = "silu",
+@@ -1263,28 +1271,30 @@ class TimestepEmbedding(nn.Module):
+         sample_proj_bias=True,
+     ):
+         super().__init__()
+-
+-        self.linear_1 = nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
++        self.name = objname
++        self.linear_1 = ttsimF.Linear(f'{self.name}_linear_1', in_channels, time_embed_dim) #, sample_proj_bias)
+ 
+         if cond_proj_dim is not None:
+-            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
++            self.cond_proj = ttsimF.Linear(f'{self.name}_cond_proj', cond_proj_dim, in_channels) #, bias=False)
+         else:
+             self.cond_proj = None
+ 
+-        self.act = get_activation(act_fn)
++        self.act = ttsimF.Silu(f'{self.name}_actfn') # get_activation(act_fn)
+ 
+         if out_dim is not None:
+             time_embed_dim_out = out_dim
+         else:
+             time_embed_dim_out = time_embed_dim
+-        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out, sample_proj_bias)
++        self.linear_2 = ttsimF.Linear(f'{self.name}_linear_2', time_embed_dim, time_embed_dim_out) #, sample_proj_bias)
+ 
+         if post_act_fn is None:
+             self.post_act = None
+         else:
+-            self.post_act = get_activation(post_act_fn)
++            self.post_act = None # get_activation(post_act_fn)
++
++        super().link_op2module()
+ 
+-    def forward(self, sample, condition=None):
++    def __call__(self, sample, condition=None):
+         if condition is not None:
+             sample = sample + self.cond_proj(condition)
+         sample = self.linear_1(sample)
+@@ -1299,15 +1309,17 @@ class TimestepEmbedding(nn.Module):
+         return sample
+ 
+ 
+-class Timesteps(nn.Module):
+-    def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
++class Timesteps(SimNN.Module):
++    def __init__(self, objname: str, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
+         super().__init__()
++        self.name = objname
+         self.num_channels = num_channels
+         self.flip_sin_to_cos = flip_sin_to_cos
+         self.downscale_freq_shift = downscale_freq_shift
+         self.scale = scale
++        super().link_op2module()
+ 
+-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
++    def __call__(self, timesteps: SimNN.SimTensor) -> SimNN.SimTensor:
+         t_emb = get_timestep_embedding(
+             timesteps,
+             self.num_channels,
+diff --git a/src/diffusers/models/resnet.py b/src/diffusers/models/resnet.py
+index c0b4ad400..b3db7bda5 100644
+--- a/src/diffusers/models/resnet.py
++++ b/src/diffusers/models/resnet.py
+@@ -20,6 +20,11 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ..utils import deprecate
+ from .activations import get_activation
+ from .attention_processor import SpatialNorm
+@@ -41,7 +46,7 @@ from .upsampling import (  # noqa
+ )
+ 
+ 
+-class ResnetBlockCondNorm2D(nn.Module):
++class ResnetBlockCondNorm2D(SimNN.Module):
+     r"""
+     A Resnet block that use normalization layer that incorporate conditioning information.
+ 
+@@ -74,6 +79,7 @@ class ResnetBlockCondNorm2D(nn.Module):
+     def __init__(
+         self,
+         *,
++        objname: str,
+         in_channels: int,
+         out_channels: Optional[int] = None,
+         conv_shortcut: bool = False,
+@@ -92,6 +98,7 @@ class ResnetBlockCondNorm2D(nn.Module):
+         conv_2d_out_channels: Optional[int] = None,
+     ):
+         super().__init__()
++        self.name = objname
+         self.in_channels = in_channels
+         out_channels = in_channels if out_channels is None else out_channels
+         self.out_channels = out_channels
+@@ -145,8 +152,9 @@ class ResnetBlockCondNorm2D(nn.Module):
+                 padding=0,
+                 bias=conv_shortcut_bias,
+             )
++        super().link_op2module()
+ 
+-    def forward(self, input_tensor: torch.Tensor, temb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
++    def __call__(self, input_tensor: torch.Tensor, temb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -186,7 +194,7 @@ class ResnetBlockCondNorm2D(nn.Module):
+         return output_tensor
+ 
+ 
+-class ResnetBlock2D(nn.Module):
++class ResnetBlock2D(SimNN.Module):
+     r"""
+     A Resnet block.
+ 
+@@ -219,7 +227,8 @@ class ResnetBlock2D(nn.Module):
+ 
+     def __init__(
+         self,
+-        *,
++        # *,
++        objname: str,
+         in_channels: int,
+         out_channels: Optional[int] = None,
+         conv_shortcut: bool = False,
+@@ -250,6 +259,8 @@ class ResnetBlock2D(nn.Module):
+                 "This class cannot be used with `time_embedding_norm==spatial`, please use `ResnetBlockCondNorm2D` instead",
+             )
+ 
++        self.non_linearity = non_linearity
++        self.name = objname
+         self.pre_norm = True
+         self.in_channels = in_channels
+         out_channels = in_channels if out_channels is None else out_channels
+@@ -264,27 +275,30 @@ class ResnetBlock2D(nn.Module):
+         if groups_out is None:
+             groups_out = groups
+ 
+-        self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
++        self.norm1 = ttsimF.GroupNorm(f'{self.name}.resnetblock2d_norm', num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
+ 
+-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
++        self.conv1 = ttsimF.Conv2d(f'{self.name}.resnetblock2d_conv2d', in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+ 
+         if temb_channels is not None:
+             if self.time_embedding_norm == "default":
+-                self.time_emb_proj = nn.Linear(temb_channels, out_channels)
++                self.time_emb_proj = ttsimF.Linear(f'{self.name}.linop1', temb_channels, out_channels)
+             elif self.time_embedding_norm == "scale_shift":
+-                self.time_emb_proj = nn.Linear(temb_channels, 2 * out_channels)
++                self.time_emb_proj = ttsimF.Linear(f'{self.name}.linop2', temb_channels, 2 * out_channels)
+             else:
+                 raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
+         else:
+             self.time_emb_proj = None
+ 
+-        self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
++        self.norm2 = ttsimF.GroupNorm(f'{self.name}.resnetblock2d_norm', num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
+ 
+-        self.dropout = torch.nn.Dropout(dropout)
++        self.dropout = ttsimF.Dropout(f'{self.name}.dropout', dropout)
+         conv_2d_out_channels = conv_2d_out_channels or out_channels
+-        self.conv2 = nn.Conv2d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
++        self.conv2 = ttsimF.Conv2d(f'{self.name}.conv2d', out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
+ 
+-        self.nonlinearity = get_activation(non_linearity)
++        # self.nonlinearity = get_activation(non_linearity)
++        self.nonlinearity1 = ttsimF.Silu(f'{self.name}.act_fn1')
++        self.nonlinearity2 = ttsimF.Silu(f'{self.name}.act_fn2')
++        self.special_nonlinearity = ttsimF.Silu(f'{self.name}.act_fn3')
+ 
+         self.upsample = self.downsample = None
+         if self.up:
+@@ -306,9 +320,13 @@ class ResnetBlock2D(nn.Module):
+ 
+         self.use_in_shortcut = self.in_channels != conv_2d_out_channels if use_in_shortcut is None else use_in_shortcut
+ 
++        self.addop1 = ttsimF.Add(f'{self.name}.add_op_1')
++        self.divop1 = ttsimF.Div(f'{self.name}.div_op_1')
++
+         self.conv_shortcut = None
+         if self.use_in_shortcut:
+-            self.conv_shortcut = nn.Conv2d(
++            self.conv_shortcut = ttsimF.Conv2d(
++                f'{self.name}.conv_shortcut',
+                 in_channels,
+                 conv_2d_out_channels,
+                 kernel_size=1,
+@@ -316,8 +334,9 @@ class ResnetBlock2D(nn.Module):
+                 padding=0,
+                 bias=conv_shortcut_bias,
+             )
++        super().link_op2module()
+ 
+-    def forward(self, input_tensor: torch.Tensor, temb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
++    def __call__(self, input_tensor: SimNN.SimTensor, temb: SimNN.SimTensor, *args, **kwargs) -> SimNN.SimTensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -325,7 +344,7 @@ class ResnetBlock2D(nn.Module):
+         hidden_states = input_tensor
+ 
+         hidden_states = self.norm1(hidden_states)
+-        hidden_states = self.nonlinearity(hidden_states)
++        hidden_states = self.nonlinearity1(hidden_states)
+ 
+         if self.upsample is not None:
+             # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+@@ -342,7 +361,7 @@ class ResnetBlock2D(nn.Module):
+ 
+         if self.time_emb_proj is not None:
+             if not self.skip_time_act:
+-                temb = self.nonlinearity(temb)
++                temb = self.nonlinearity2(temb)
+             temb = self.time_emb_proj(temb)[:, :, None, None]
+ 
+         if self.time_embedding_norm == "default":
+@@ -360,7 +379,7 @@ class ResnetBlock2D(nn.Module):
+         else:
+             hidden_states = self.norm2(hidden_states)
+ 
+-        hidden_states = self.nonlinearity(hidden_states)
++        hidden_states = self.special_nonlinearity(hidden_states) if self.non_linearity == "silu" else self.nonlinearity(hidden_states)
+ 
+         hidden_states = self.dropout(hidden_states)
+         hidden_states = self.conv2(hidden_states)
+@@ -368,7 +387,13 @@ class ResnetBlock2D(nn.Module):
+         if self.conv_shortcut is not None:
+             input_tensor = self.conv_shortcut(input_tensor.contiguous())
+ 
+-        output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
++        div_tensor = SimNN.SimTensor({
++            'name': 'div_tensor',
++            'shape': input_tensor.shape,
++            'dtype': input_tensor.dtype,
++        }) 
++        # print(f'input tensor shape is {input_tensor.shape} and hidden states shape is {hidden_states.shape}')
++        output_tensor = self.divop1(self.addop1(input_tensor, hidden_states), div_tensor)
+ 
+         return output_tensor
+ 
+diff --git a/src/diffusers/models/transformers/transformer_2d.py b/src/diffusers/models/transformers/transformer_2d.py
+index 67fe9a331..075cd8db5 100644
+--- a/src/diffusers/models/transformers/transformer_2d.py
++++ b/src/diffusers/models/transformers/transformer_2d.py
+@@ -17,6 +17,11 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ...configuration_utils import LegacyConfigMixin, register_to_config
+ from ...utils import deprecate, logging
+ from ..attention import BasicTransformerBlock
+@@ -36,7 +41,7 @@ class Transformer2DModelOutput(Transformer2DModelOutput):
+         super().__init__(*args, **kwargs)
+ 
+ 
+-class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
++class Transformer2DModel(SimNN.Module, LegacyModelMixin, LegacyConfigMixin):
+     """
+     A 2D Transformer model for image-like data.
+ 
+@@ -71,6 +76,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+     @register_to_config
+     def __init__(
+         self,
++        objname: str,
+         num_attention_heads: int = 16,
+         attention_head_dim: int = 88,
+         in_channels: Optional[int] = None,
+@@ -99,6 +105,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+     ):
+         super().__init__()
+ 
++        self.name = objname
+         # Validate inputs.
+         if patch_size is not None:
+             if norm_type not in ["ada_norm", "ada_norm_zero", "ada_norm_single"]:
+@@ -110,6 +117,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+                     f"When using a `patch_size` and this `norm_type` ({norm_type}), `num_embeds_ada_norm` cannot be None."
+                 )
+ 
++        self.permuteop = ttsimF.permute(f'{self.name}.perm_op')
+         # 1. Transformer2DModel can process both standard continuous images of shape `(batch_size, num_channels, width, height)` as well as quantized image embeddings of shape `(batch_size, num_image_vectors)`
+         # Define whether input is continuous or discrete depending on configuration
+         self.is_input_continuous = (in_channels is not None) and (patch_size is None)
+@@ -173,17 +181,18 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+             self._init_patched_inputs(norm_type=norm_type)
+ 
+     def _init_continuous_input(self, norm_type):
+-        self.norm = torch.nn.GroupNorm(
++        self.norm = ttsimF.GroupNorm(f'{self.name}.grpnrm1',
+             num_groups=self.config.norm_num_groups, num_channels=self.in_channels, eps=1e-6, affine=True
+         )
+         if self.use_linear_projection:
+             self.proj_in = torch.nn.Linear(self.in_channels, self.inner_dim)
+         else:
+-            self.proj_in = torch.nn.Conv2d(self.in_channels, self.inner_dim, kernel_size=1, stride=1, padding=0)
++            self.proj_in = ttsimF.Conv2d(f'{self.name}.conv_in', self.in_channels, self.inner_dim, kernel_size=1, stride=1, padding=0)
+ 
+-        self.transformer_blocks = nn.ModuleList(
++        self.transformer_blocks = SimNN.ModuleList(
+             [
+                 BasicTransformerBlock(
++                    f"{self.name}.transformer_block_{i}",
+                     self.inner_dim,
+                     self.config.num_attention_heads,
+                     self.config.attention_head_dim,
+@@ -200,14 +209,14 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+                     norm_eps=self.config.norm_eps,
+                     attention_type=self.config.attention_type,
+                 )
+-                for _ in range(self.config.num_layers)
++                for i in range(self.config.num_layers)
+             ]
+         )
+ 
+         if self.use_linear_projection:
+             self.proj_out = torch.nn.Linear(self.inner_dim, self.out_channels)
+         else:
+-            self.proj_out = torch.nn.Conv2d(self.inner_dim, self.out_channels, kernel_size=1, stride=1, padding=0)
++            self.proj_out = ttsimF.Conv2d(f'{self.name}.conv_out', self.inner_dim, self.out_channels, kernel_size=1, stride=1, padding=0)
+ 
+     def _init_vectorized_inputs(self, norm_type):
+         assert self.config.sample_size is not None, "Transformer2DModel over discrete input must provide sample_size"
+@@ -270,9 +279,10 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+             interpolation_scale=interpolation_scale,
+         )
+ 
+-        self.transformer_blocks = nn.ModuleList(
++        self.transformer_blocks = SimNN.ModuleList(
+             [
+                 BasicTransformerBlock(
++                    f'transformer_block_{i}',
+                     self.inner_dim,
+                     self.config.num_attention_heads,
+                     self.config.attention_head_dim,
+@@ -289,7 +299,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+                     norm_eps=self.config.norm_eps,
+                     attention_type=self.config.attention_type,
+                 )
+-                for _ in range(self.config.num_layers)
++                for i in range(self.config.num_layers)
+             ]
+         )
+ 
+@@ -321,7 +331,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+                 in_features=self.caption_channels, hidden_size=self.inner_dim
+             )
+ 
+-    def forward(
++    def __call__(
+         self,
+         hidden_states: torch.Tensor,
+         encoder_hidden_states: Optional[torch.Tensor] = None,
+@@ -468,10 +478,16 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+         if not self.use_linear_projection:
+             hidden_states = self.proj_in(hidden_states)
+             inner_dim = hidden_states.shape[1]
+-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
++            import numpy as np
++            data = np.array([0, 2, 3, 1], dtype=np.int64)
++            perm_shape_tensor = ttsimF._from_data(self.name + '.perm_shape', data, is_param=False, is_const=True)
++            hidden_states = self.permuteop(hidden_states, perm_shape_tensor)
++            hidden_states.set_module(SimNN.Module())
++            # hidden_states.set_dummy_module()
++            hidden_states = hidden_states.reshape(batch, height * width, inner_dim)
+         else:
+             inner_dim = hidden_states.shape[1]
+-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
++            hidden_states = self.permuteop(hidden_states, (0, 2, 3, 1)).reshape(batch, height * width, inner_dim)
+             hidden_states = self.proj_in(hidden_states)
+ 
+         return hidden_states, inner_dim
+@@ -498,8 +514,13 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
+ 
+     def _get_output_for_continuous_inputs(self, hidden_states, residual, batch_size, height, width, inner_dim):
+         if not self.use_linear_projection:
++            def permuteop(hidden_states, permshape):
++                import numpy as np
++                data = np.array(permshape)
++                op = ttsimF.permute(f'{self.name}.permute_op')
++                return op(hidden_states, ttsimF._from_data(self.name + '.permute_shape', data, is_param=False, is_const=True))
+             hidden_states = (
+-                hidden_states.reshape(batch_size, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
++                permuteop(hidden_states.reshape(batch_size, height, width, inner_dim), [0, 3, 1, 2]).contiguous()
+             )
+             hidden_states = self.proj_out(hidden_states)
+         else:
+diff --git a/src/diffusers/models/unets/unet_2d_blocks.py b/src/diffusers/models/unets/unet_2d_blocks.py
+index 94a9245e5..7e76ae76b 100644
+--- a/src/diffusers/models/unets/unet_2d_blocks.py
++++ b/src/diffusers/models/unets/unet_2d_blocks.py
+@@ -18,6 +18,11 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ...utils import deprecate, logging
+ from ...utils.torch_utils import apply_freeu
+ from ..activations import get_activation
+@@ -77,6 +82,7 @@ def get_down_block(
+     down_block_type = down_block_type[7:] if down_block_type.startswith("UNetRes") else down_block_type
+     if down_block_type == "DownBlock2D":
+         return DownBlock2D(
++            objname = "down_block_2d",
+             num_layers=num_layers,
+             in_channels=in_channels,
+             out_channels=out_channels,
+@@ -127,6 +133,7 @@ def get_down_block(
+         if cross_attention_dim is None:
+             raise ValueError("cross_attention_dim must be specified for CrossAttnDownBlock2D")
+         return CrossAttnDownBlock2D(
++            objname="CrossAttnDownBlock2D",
+             num_layers=num_layers,
+             transformer_layers_per_block=transformer_layers_per_block,
+             in_channels=in_channels,
+@@ -196,6 +203,7 @@ def get_down_block(
+         )
+     elif down_block_type == "DownEncoderBlock2D":
+         return DownEncoderBlock2D(
++            objname="downencoderblock2d_resnet",
+             num_layers=num_layers,
+             in_channels=in_channels,
+             out_channels=out_channels,
+@@ -273,6 +281,7 @@ def get_mid_block(
+ ):
+     if mid_block_type == "UNetMidBlock2DCrossAttn":
+         return UNetMidBlock2DCrossAttn(
++            'time_embedding',
+             transformer_layers_per_block=transformer_layers_per_block,
+             in_channels=in_channels,
+             temb_channels=temb_channels,
+@@ -291,6 +300,7 @@ def get_mid_block(
+         )
+     elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
+         return UNetMidBlock2DSimpleCrossAttn(
++            'time_embedding',
+             in_channels=in_channels,
+             temb_channels=temb_channels,
+             dropout=dropout,
+@@ -307,6 +317,7 @@ def get_mid_block(
+         )
+     elif mid_block_type == "UNetMidBlock2D":
+         return UNetMidBlock2D(
++            'time_embedding',
+             in_channels=in_channels,
+             temb_channels=temb_channels,
+             dropout=dropout,
+@@ -351,7 +362,7 @@ def get_up_block(
+     attention_head_dim: Optional[int] = None,
+     upsample_type: Optional[str] = None,
+     dropout: float = 0.0,
+-) -> nn.Module:
++) -> SimNN.Module:
+     # If attn head dim is not defined, we default it to the number of heads
+     if attention_head_dim is None:
+         logger.warning(
+@@ -362,6 +373,7 @@ def get_up_block(
+     up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
+     if up_block_type == "UpBlock2D":
+         return UpBlock2D(
++            objname="up_block",
+             num_layers=num_layers,
+             in_channels=in_channels,
+             out_channels=out_channels,
+@@ -396,6 +408,7 @@ def get_up_block(
+         if cross_attention_dim is None:
+             raise ValueError("cross_attention_dim must be specified for CrossAttnUpBlock2D")
+         return CrossAttnUpBlock2D(
++            objname="cross_attn",
+             num_layers=num_layers,
+             transformer_layers_per_block=transformer_layers_per_block,
+             in_channels=in_channels,
+@@ -492,6 +505,7 @@ def get_up_block(
+         )
+     elif up_block_type == "UpDecoderBlock2D":
+         return UpDecoderBlock2D(
++            objname="up_decoder_block",
+             num_layers=num_layers,
+             in_channels=in_channels,
+             out_channels=out_channels,
+@@ -586,7 +600,7 @@ class AutoencoderTinyBlock(nn.Module):
+         return self.fuse(self.conv(x) + self.skip(x))
+ 
+ 
+-class UNetMidBlock2D(nn.Module):
++class UNetMidBlock2D(SimNN.Module):
+     """
+     A 2D UNet mid-block [`UNetMidBlock2D`] with multiple residual blocks and optional attention blocks.
+ 
+@@ -619,6 +633,7 @@ class UNetMidBlock2D(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         temb_channels: int,
+         dropout: float = 0.0,
+@@ -637,6 +652,7 @@ class UNetMidBlock2D(nn.Module):
+         resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
+         self.add_attention = add_attention
+ 
++        self.name = objname
+         if attn_groups is None:
+             attn_groups = resnet_groups if resnet_time_scale_shift == "default" else None
+ 
+@@ -658,6 +674,7 @@ class UNetMidBlock2D(nn.Module):
+         else:
+             resnets = [
+                 ResnetBlock2D(
++                    objname="resnet_block",
+                     in_channels=in_channels,
+                     out_channels=in_channels,
+                     temb_channels=temb_channels,
+@@ -682,6 +699,7 @@ class UNetMidBlock2D(nn.Module):
+             if self.add_attention:
+                 attentions.append(
+                     Attention(
++                        "attn_block",
+                         in_channels,
+                         heads=in_channels // attention_head_dim,
+                         dim_head=attention_head_dim,
+@@ -701,6 +719,7 @@ class UNetMidBlock2D(nn.Module):
+             if resnet_time_scale_shift == "spatial":
+                 resnets.append(
+                     ResnetBlockCondNorm2D(
++                        objname="resnet_block",
+                         in_channels=in_channels,
+                         out_channels=in_channels,
+                         temb_channels=temb_channels,
+@@ -715,6 +734,7 @@ class UNetMidBlock2D(nn.Module):
+             else:
+                 resnets.append(
+                     ResnetBlock2D(
++                        objname="resnet_block",
+                         in_channels=in_channels,
+                         out_channels=in_channels,
+                         temb_channels=temb_channels,
+@@ -728,12 +748,13 @@ class UNetMidBlock2D(nn.Module):
+                     )
+                 )
+ 
+-        self.attentions = nn.ModuleList(attentions)
+-        self.resnets = nn.ModuleList(resnets)
++        self.attentions = SimNN.ModuleList(attentions)
++        self.resnets = SimNN.ModuleList(resnets)
+ 
+         self.gradient_checkpointing = False
++        super().link_op2module()
+ 
+-    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
++    def __call__(self, hidden_states: SimNN.SimTensor, temb: Optional[SimNN.SimTensor] = None) -> SimNN.SimTensor:
+         hidden_states = self.resnets[0](hidden_states, temb)
+         for attn, resnet in zip(self.attentions, self.resnets[1:]):
+             if torch.is_grad_enabled() and self.gradient_checkpointing:
+@@ -748,9 +769,10 @@ class UNetMidBlock2D(nn.Module):
+         return hidden_states
+ 
+ 
+-class UNetMidBlock2DCrossAttn(nn.Module):
++class UNetMidBlock2DCrossAttn(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         temb_channels: int,
+         out_channels: Optional[int] = None,
+@@ -772,7 +794,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
+         attention_type: str = "default",
+     ):
+         super().__init__()
+-
++        self.name = objname
+         out_channels = out_channels or in_channels
+         self.in_channels = in_channels
+         self.out_channels = out_channels
+@@ -790,6 +812,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
+         # there is always at least one resnet
+         resnets = [
+             ResnetBlock2D(
++                objname="resnet_block",
+                 in_channels=in_channels,
+                 out_channels=out_channels,
+                 temb_channels=temb_channels,
+@@ -809,6 +832,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
+             if not dual_cross_attention:
+                 attentions.append(
+                     Transformer2DModel(
++                        f"transformer_block_{i}",
+                         num_attention_heads,
+                         out_channels // num_attention_heads,
+                         in_channels=out_channels,
+@@ -833,6 +857,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
+                 )
+             resnets.append(
+                 ResnetBlock2D(
++                    objname="resnet_block",
+                     in_channels=out_channels,
+                     out_channels=out_channels,
+                     temb_channels=temb_channels,
+@@ -846,20 +871,30 @@ class UNetMidBlock2DCrossAttn(nn.Module):
+                 )
+             )
+ 
+-        self.attentions = nn.ModuleList(attentions)
+-        self.resnets = nn.ModuleList(resnets)
++        for i in range(num_layers):
++            if i == 0:
++                self.attentions = SimNN.ModuleList([attentions[i]])
++            else:
++                self.attentions.append(attentions[i])
++
++        for i in range(len(resnets)):
++            if i == 0:
++                self.resnets = SimNN.ModuleList([resnets[i]])
++            else:
++                self.resnets.append(resnets[i])
+ 
+         self.gradient_checkpointing = False
++        super().link_op2module()
+ 
+-    def forward(
++    def __call__(
+         self,
+-        hidden_states: torch.Tensor,
+-        temb: Optional[torch.Tensor] = None,
+-        encoder_hidden_states: Optional[torch.Tensor] = None,
+-        attention_mask: Optional[torch.Tensor] = None,
++        hidden_states: SimNN.SimTensor,
++        temb: Optional[SimNN.SimTensor] = None,
++        encoder_hidden_states: Optional[SimNN.SimTensor] = None,
++        attention_mask: Optional[SimNN.SimTensor] = None,
+         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+-        encoder_attention_mask: Optional[torch.Tensor] = None,
+-    ) -> torch.Tensor:
++        encoder_attention_mask: Optional[SimNN.SimTensor] = None,
++    ) -> SimNN.SimTensor:
+         if cross_attention_kwargs is not None:
+             if cross_attention_kwargs.get("scale", None) is not None:
+                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
+@@ -890,9 +925,10 @@ class UNetMidBlock2DCrossAttn(nn.Module):
+         return hidden_states
+ 
+ 
+-class UNetMidBlock2DSimpleCrossAttn(nn.Module):
++class UNetMidBlock2DSimpleCrossAttn(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         temb_channels: int,
+         dropout: float = 0.0,
+@@ -912,6 +948,7 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
+         super().__init__()
+ 
+         self.has_cross_attention = True
++        self.name = objname
+ 
+         self.attention_head_dim = attention_head_dim
+         resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
+@@ -974,8 +1011,9 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
+ 
+         self.attentions = nn.ModuleList(attentions)
+         self.resnets = nn.ModuleList(resnets)
++        super().link_op2module()
+ 
+-    def forward(
++    def __call__(
+         self,
+         hidden_states: torch.Tensor,
+         temb: Optional[torch.Tensor] = None,
+@@ -1144,9 +1182,10 @@ class AttnDownBlock2D(nn.Module):
+         return hidden_states, output_states
+ 
+ 
+-class CrossAttnDownBlock2D(nn.Module):
++class CrossAttnDownBlock2D(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         out_channels: int,
+         temb_channels: int,
+@@ -1172,6 +1211,7 @@ class CrossAttnDownBlock2D(nn.Module):
+         super().__init__()
+         resnets = []
+         attentions = []
++        self.name = objname
+ 
+         self.has_cross_attention = True
+         self.num_attention_heads = num_attention_heads
+@@ -1182,6 +1222,7 @@ class CrossAttnDownBlock2D(nn.Module):
+             in_channels = in_channels if i == 0 else out_channels
+             resnets.append(
+                 ResnetBlock2D(
++                    objname=f"{objname}_resnet_block_{i}",
+                     in_channels=in_channels,
+                     out_channels=out_channels,
+                     temb_channels=temb_channels,
+@@ -1197,6 +1238,7 @@ class CrossAttnDownBlock2D(nn.Module):
+             if not dual_cross_attention:
+                 attentions.append(
+                     Transformer2DModel(
++                        f"transformer_block_{i}",
+                         num_attention_heads,
+                         out_channels // num_attention_heads,
+                         in_channels=out_channels,
+@@ -1220,13 +1262,18 @@ class CrossAttnDownBlock2D(nn.Module):
+                         norm_num_groups=resnet_groups,
+                     )
+                 )
+-        self.attentions = nn.ModuleList(attentions)
+-        self.resnets = nn.ModuleList(resnets)
++        for i in range(num_layers):
++            if i == 0:
++                self.attentions = SimNN.ModuleList([attentions[i]])
++                self.resnets = SimNN.ModuleList([resnets[i]])
++            else:
++                self.attentions.append(attentions[i])
++                self.resnets.append(resnets[i])
+ 
+         if add_downsample:
+-            self.downsamplers = nn.ModuleList(
++            self.downsamplers = SimNN.ModuleList(
+                 [
+-                    Downsample2D(
++                    Downsample2D('downsample_2d',
+                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
+                     )
+                 ]
+@@ -1235,17 +1282,18 @@ class CrossAttnDownBlock2D(nn.Module):
+             self.downsamplers = None
+ 
+         self.gradient_checkpointing = False
++        super().link_op2module()
+ 
+-    def forward(
++    def __call__(
+         self,
+-        hidden_states: torch.Tensor,
+-        temb: Optional[torch.Tensor] = None,
+-        encoder_hidden_states: Optional[torch.Tensor] = None,
+-        attention_mask: Optional[torch.Tensor] = None,
++        hidden_states: SimNN.SimTensor,
++        temb: Optional[SimNN.SimTensor] = None,
++        encoder_hidden_states: Optional[SimNN.SimTensor] = None,
++        attention_mask: Optional[SimNN.SimTensor] = None,
+         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+-        encoder_attention_mask: Optional[torch.Tensor] = None,
+-        additional_residuals: Optional[torch.Tensor] = None,
+-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
++        encoder_attention_mask: Optional[SimNN.SimTensor] = None,
++        additional_residuals: Optional[SimNN.SimTensor] = None,
++    ) -> Tuple[SimNN.SimTensor, Tuple[SimNN.SimTensor, ...]]:
+         if cross_attention_kwargs is not None:
+             if cross_attention_kwargs.get("scale", None) is not None:
+                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
+@@ -1291,9 +1339,10 @@ class CrossAttnDownBlock2D(nn.Module):
+         return hidden_states, output_states
+ 
+ 
+-class DownBlock2D(nn.Module):
++class DownBlock2D(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         out_channels: int,
+         temb_channels: int,
+@@ -1310,11 +1359,12 @@ class DownBlock2D(nn.Module):
+     ):
+         super().__init__()
+         resnets = []
+-
++        self.name = objname
+         for i in range(num_layers):
+             in_channels = in_channels if i == 0 else out_channels
+             resnets.append(
+                 ResnetBlock2D(
++                    objname=f"down_resnet_{i}",
+                     in_channels=in_channels,
+                     out_channels=out_channels,
+                     temb_channels=temb_channels,
+@@ -1328,12 +1378,16 @@ class DownBlock2D(nn.Module):
+                 )
+             )
+ 
+-        self.resnets = nn.ModuleList(resnets)
++        for i in range(num_layers):
++            if i == 0:
++                self.resnets = SimNN.ModuleList([resnets[i]])
++            else:
++                self.resnets.append(resnets[i])
+ 
+         if add_downsample:
+-            self.downsamplers = nn.ModuleList(
++            self.downsamplers = SimNN.ModuleList(
+                 [
+-                    Downsample2D(
++                    Downsample2D('downsample_2d',
+                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
+                     )
+                 ]
+@@ -1342,10 +1396,11 @@ class DownBlock2D(nn.Module):
+             self.downsamplers = None
+ 
+         self.gradient_checkpointing = False
++        super().link_op2module()
+ 
+-    def forward(
+-        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None, *args, **kwargs
+-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
++    def __call__(
++        self, hidden_states: SimNN.SimTensor, temb: Optional[SimNN.SimTensor] = None, *args, **kwargs
++    ) -> Tuple[SimNN.SimTensor, Tuple[SimNN.SimTensor, ...]]:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -1368,10 +1423,10 @@ class DownBlock2D(nn.Module):
+ 
+         return hidden_states, output_states
+ 
+-
+-class DownEncoderBlock2D(nn.Module):
++class DownEncoderBlock2D(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         out_channels: int,
+         dropout: float = 0.0,
+@@ -1387,6 +1442,7 @@ class DownEncoderBlock2D(nn.Module):
+     ):
+         super().__init__()
+         resnets = []
++        self.name = objname
+ 
+         for i in range(num_layers):
+             in_channels = in_channels if i == 0 else out_channels
+@@ -1407,6 +1463,7 @@ class DownEncoderBlock2D(nn.Module):
+             else:
+                 resnets.append(
+                     ResnetBlock2D(
++                        objname=f"downencoderblock2d_resnet_{i}",
+                         in_channels=in_channels,
+                         out_channels=out_channels,
+                         temb_channels=None,
+@@ -1420,20 +1477,26 @@ class DownEncoderBlock2D(nn.Module):
+                     )
+                 )
+ 
+-        self.resnets = nn.ModuleList(resnets)
++        self.resnets = SimNN.ModuleList(resnets)
+ 
+         if add_downsample:
+-            self.downsamplers = nn.ModuleList(
++            self.downsamplers = SimNN.ModuleList(
+                 [
+                     Downsample2D(
+-                        out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
++                        objname="downsample2d",
++                        channels=out_channels,
++                        use_conv=True,
++                        out_channels=out_channels,
++                        padding=downsample_padding,
++                        name="op"
+                     )
+                 ]
+             )
+         else:
+             self.downsamplers = None
++        super().link_op2module()
+ 
+-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
++    def __call__(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -2311,9 +2374,10 @@ class AttnUpBlock2D(nn.Module):
+         return hidden_states
+ 
+ 
+-class CrossAttnUpBlock2D(nn.Module):
++class CrossAttnUpBlock2D(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         out_channels: int,
+         prev_output_channel: int,
+@@ -2340,6 +2404,7 @@ class CrossAttnUpBlock2D(nn.Module):
+         super().__init__()
+         resnets = []
+         attentions = []
++        self.name = objname
+ 
+         self.has_cross_attention = True
+         self.num_attention_heads = num_attention_heads
+@@ -2353,6 +2418,7 @@ class CrossAttnUpBlock2D(nn.Module):
+ 
+             resnets.append(
+                 ResnetBlock2D(
++                    objname=f'{self.name}.resnet_{i}',
+                     in_channels=resnet_in_channels + res_skip_channels,
+                     out_channels=out_channels,
+                     temb_channels=temb_channels,
+@@ -2368,6 +2434,7 @@ class CrossAttnUpBlock2D(nn.Module):
+             if not dual_cross_attention:
+                 attentions.append(
+                     Transformer2DModel(
++                        f'{self.name}.cross_attn_{i}',
+                         num_attention_heads,
+                         out_channels // num_attention_heads,
+                         in_channels=out_channels,
+@@ -2383,6 +2450,7 @@ class CrossAttnUpBlock2D(nn.Module):
+             else:
+                 attentions.append(
+                     DualTransformer2DModel(
++                        f'{self.name}.cross_attn_{i}',
+                         num_attention_heads,
+                         out_channels // num_attention_heads,
+                         in_channels=out_channels,
+@@ -2391,28 +2459,40 @@ class CrossAttnUpBlock2D(nn.Module):
+                         norm_num_groups=resnet_groups,
+                     )
+                 )
+-        self.attentions = nn.ModuleList(attentions)
+-        self.resnets = nn.ModuleList(resnets)
++
++        for i in range(len(attentions)):
++            if i == 0:
++                self.attentions = SimNN.ModuleList([attentions[i]])
++            else:
++                self.attentions.append(attentions[i])
++
++        for i in range(len(resnets)):
++            if i == 0:
++                self.resnets = SimNN.ModuleList([resnets[i]])
++            else:
++                self.resnets.append(resnets[i])
+ 
+         if add_upsample:
+-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
++            self.upsamplers = SimNN.ModuleList([Upsample2D(f'{self.name}.upsample', out_channels, use_conv=True, out_channels=out_channels)])
+         else:
+             self.upsamplers = None
+ 
+         self.gradient_checkpointing = False
+         self.resolution_idx = resolution_idx
++        self.cat = ttsimF.ConcatX(f'{self.name}.catop', axis = 1)
++        super().link_op2module()
+ 
+-    def forward(
++    def __call__(
+         self,
+-        hidden_states: torch.Tensor,
+-        res_hidden_states_tuple: Tuple[torch.Tensor, ...],
+-        temb: Optional[torch.Tensor] = None,
+-        encoder_hidden_states: Optional[torch.Tensor] = None,
++        hidden_states: SimNN.SimTensor,
++        res_hidden_states_tuple: Tuple[SimNN.SimTensor, ...],
++        temb: Optional[SimNN.SimTensor] = None,
++        encoder_hidden_states: Optional[SimNN.SimTensor] = None,
+         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+         upsample_size: Optional[int] = None,
+-        attention_mask: Optional[torch.Tensor] = None,
+-        encoder_attention_mask: Optional[torch.Tensor] = None,
+-    ) -> torch.Tensor:
++        attention_mask: Optional[SimNN.SimTensor] = None,
++        encoder_attention_mask: Optional[SimNN.SimTensor] = None,
++    ) -> SimNN.SimTensor:
+         if cross_attention_kwargs is not None:
+             if cross_attention_kwargs.get("scale", None) is not None:
+                 logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
+@@ -2441,7 +2521,7 @@ class CrossAttnUpBlock2D(nn.Module):
+                     b2=self.b2,
+                 )
+ 
+-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
++            hidden_states = self.cat(hidden_states, res_hidden_states)
+ 
+             if torch.is_grad_enabled() and self.gradient_checkpointing:
+                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states, temb)
+@@ -2471,9 +2551,10 @@ class CrossAttnUpBlock2D(nn.Module):
+         return hidden_states
+ 
+ 
+-class UpBlock2D(nn.Module):
++class UpBlock2D(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         prev_output_channel: int,
+         out_channels: int,
+@@ -2491,6 +2572,7 @@ class UpBlock2D(nn.Module):
+     ):
+         super().__init__()
+         resnets = []
++        self.name = objname
+ 
+         for i in range(num_layers):
+             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+@@ -2498,6 +2580,7 @@ class UpBlock2D(nn.Module):
+ 
+             resnets.append(
+                 ResnetBlock2D(
++                    objname=f"{self.name}.resnet_block_{i}",
+                     in_channels=resnet_in_channels + res_skip_channels,
+                     out_channels=out_channels,
+                     temb_channels=temb_channels,
+@@ -2511,25 +2594,31 @@ class UpBlock2D(nn.Module):
+                 )
+             )
+ 
+-        self.resnets = nn.ModuleList(resnets)
++        for i in range(num_layers):
++            if i == 0:
++                self.resnets = SimNN.ModuleList([resnets[i]])
++            else:
++                self.resnets.append(resnets[i])
+ 
+         if add_upsample:
+-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
++            self.upsamplers = SimNN.ModuleList([Upsample2D(f'{self.name}.upsample', out_channels, use_conv=True, out_channels=out_channels)])
+         else:
+             self.upsamplers = None
+ 
+         self.gradient_checkpointing = False
+         self.resolution_idx = resolution_idx
++        self.cat = ttsimF.ConcatX(f'{self.name}.catop', axis = 1)
++        self.link_op2module()
+ 
+-    def forward(
++    def __call__(
+         self,
+-        hidden_states: torch.Tensor,
+-        res_hidden_states_tuple: Tuple[torch.Tensor, ...],
+-        temb: Optional[torch.Tensor] = None,
++        hidden_states: SimNN.SimTensor,
++        res_hidden_states_tuple: Tuple[SimNN.SimTensor, ...],
++        temb: Optional[SimNN.SimTensor] = None,
+         upsample_size: Optional[int] = None,
+         *args,
+         **kwargs,
+-    ) -> torch.Tensor:
++    ) -> SimNN.SimTensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -2558,7 +2647,7 @@ class UpBlock2D(nn.Module):
+                     b2=self.b2,
+                 )
+ 
+-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
++            hidden_states = self.cat(hidden_states, res_hidden_states)
+ 
+             if torch.is_grad_enabled() and self.gradient_checkpointing:
+                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states, temb)
+@@ -2572,9 +2661,10 @@ class UpBlock2D(nn.Module):
+         return hidden_states
+ 
+ 
+-class UpDecoderBlock2D(nn.Module):
++class UpDecoderBlock2D(SimNN.Module):
+     def __init__(
+         self,
++        objname: str,
+         in_channels: int,
+         out_channels: int,
+         resolution_idx: Optional[int] = None,
+@@ -2591,6 +2681,7 @@ class UpDecoderBlock2D(nn.Module):
+     ):
+         super().__init__()
+         resnets = []
++        self.name = objname
+ 
+         for i in range(num_layers):
+             input_channels = in_channels if i == 0 else out_channels
+@@ -2598,6 +2689,7 @@ class UpDecoderBlock2D(nn.Module):
+             if resnet_time_scale_shift == "spatial":
+                 resnets.append(
+                     ResnetBlockCondNorm2D(
++                        objname=f"{self.name}.up_decoder_block_{i}",
+                         in_channels=input_channels,
+                         out_channels=out_channels,
+                         temb_channels=temb_channels,
+@@ -2612,6 +2704,7 @@ class UpDecoderBlock2D(nn.Module):
+             else:
+                 resnets.append(
+                     ResnetBlock2D(
++                        objname=f"{self.name}.up_decoder_block_{i}",
+                         in_channels=input_channels,
+                         out_channels=out_channels,
+                         temb_channels=temb_channels,
+@@ -2625,16 +2718,17 @@ class UpDecoderBlock2D(nn.Module):
+                     )
+                 )
+ 
+-        self.resnets = nn.ModuleList(resnets)
++        self.resnets = SimNN.ModuleList(resnets)
+ 
+         if add_upsample:
+-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
++            self.upsamplers = SimNN.ModuleList([Upsample2D(f'{self.name}.upsample', out_channels, use_conv=True, out_channels=out_channels)])
+         else:
+             self.upsamplers = None
+ 
+         self.resolution_idx = resolution_idx
++        super().link_op2module()
+ 
+-    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
++    def __call__(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
+         for resnet in self.resnets:
+             hidden_states = resnet(hidden_states, temb=temb)
+ 
+diff --git a/src/diffusers/models/unets/unet_2d_condition.py b/src/diffusers/models/unets/unet_2d_condition.py
+index 736deb28c..dfffb67d1 100644
+--- a/src/diffusers/models/unets/unet_2d_condition.py
++++ b/src/diffusers/models/unets/unet_2d_condition.py
+@@ -18,6 +18,11 @@ import torch
+ import torch.nn as nn
+ import torch.utils.checkpoint
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ from ...configuration_utils import ConfigMixin, register_to_config
+ from ...loaders import PeftAdapterMixin, UNet2DConditionLoadersMixin
+ from ...loaders.single_file_model import FromOriginalModelMixin
+@@ -68,7 +73,7 @@ class UNet2DConditionOutput(BaseOutput):
+     sample: torch.Tensor = None
+ 
+ 
+-class UNet2DConditionModel(
++class UNet2DConditionModel(SimNN.Module,
+     ModelMixin, ConfigMixin, FromOriginalModelMixin, UNet2DConditionLoadersMixin, PeftAdapterMixin
+ ):
+     r"""
+@@ -172,6 +177,7 @@ class UNet2DConditionModel(
+     @register_to_config
+     def __init__(
+         self,
++        objname: str,
+         sample_size: Optional[Union[int, Tuple[int, int]]] = None,
+         in_channels: int = 4,
+         out_channels: int = 4,
+@@ -228,6 +234,7 @@ class UNet2DConditionModel(
+     ):
+         super().__init__()
+ 
++        self.name = objname
+         self.sample_size = sample_size
+ 
+         if num_attention_heads is not None:
+@@ -259,7 +266,7 @@ class UNet2DConditionModel(
+ 
+         # input
+         conv_in_padding = (conv_in_kernel - 1) // 2
+-        self.conv_in = nn.Conv2d(
++        self.conv_in = ttsimF.Conv2d(f'{self.name}.conv_in',
+             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
+         )
+ 
+@@ -273,6 +280,7 @@ class UNet2DConditionModel(
+         )
+ 
+         self.time_embedding = TimestepEmbedding(
++            f'{self.name}.time_embedding',
+             timestep_input_dim,
+             time_embed_dim,
+             act_fn=act_fn,
+@@ -311,10 +319,10 @@ class UNet2DConditionModel(
+         if time_embedding_act_fn is None:
+             self.time_embed_act = None
+         else:
+-            self.time_embed_act = get_activation(time_embedding_act_fn)
++            self.time_embed_act = None #get_activation(time_embedding_act_fn)
+ 
+-        self.down_blocks = nn.ModuleList([])
+-        self.up_blocks = nn.ModuleList([])
++        self.down_blocks = None #nn.ModuleList([])
++        self.up_blocks = None #nn.ModuleList([])
+ 
+         if isinstance(only_cross_attention, bool):
+             if mid_block_only_cross_attention is None:
+@@ -381,7 +389,10 @@ class UNet2DConditionModel(
+                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
+                 dropout=dropout,
+             )
+-            self.down_blocks.append(down_block)
++            if self.down_blocks is None:
++                self.down_blocks = SimNN.ModuleList([down_block])
++            else:
++                self.down_blocks.append(down_block)
+ 
+         # mid
+         self.mid_block = get_mid_block(
+@@ -464,26 +475,30 @@ class UNet2DConditionModel(
+                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
+                 dropout=dropout,
+             )
+-            self.up_blocks.append(up_block)
++            if self.up_blocks is None:
++                self.up_blocks = SimNN.ModuleList([up_block])
++            else:
++                self.up_blocks.append(up_block)
+ 
+         # out
+         if norm_num_groups is not None:
+-            self.conv_norm_out = nn.GroupNorm(
++            self.conv_norm_out = ttsimF.GroupNorm(f'{self.name}.conv_norm_out',
+                 num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
+             )
+ 
+-            self.conv_act = get_activation(act_fn)
++            self.conv_act = ttsimF.Silu(f'{self.name}.siluop') #get_activation(act_fn)
+ 
+         else:
+             self.conv_norm_out = None
+             self.conv_act = None
+ 
+         conv_out_padding = (conv_out_kernel - 1) // 2
+-        self.conv_out = nn.Conv2d(
++        self.conv_out = ttsimF.Conv2d(f'{self.name}.conv_out',
+             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
+         )
+ 
+         self._set_pos_net_if_use_gligen(attention_type=attention_type, cross_attention_dim=cross_attention_dim)
++        super().link_op2module()
+ 
+     def _check_config(
+         self,
+@@ -556,7 +571,7 @@ class UNet2DConditionModel(
+         elif time_embedding_type == "positional":
+             time_embed_dim = time_embedding_dim or block_out_channels[0] * 4
+ 
+-            self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
++            self.time_proj = Timesteps('time_proj', block_out_channels[0], flip_sin_to_cos, freq_shift)
+             timestep_input_dim = block_out_channels[0]
+         else:
+             raise ValueError(
+@@ -906,10 +921,10 @@ class UNet2DConditionModel(
+             self.set_attn_processor(self.original_attn_processors)
+ 
+     def get_time_embed(
+-        self, sample: torch.Tensor, timestep: Union[torch.Tensor, float, int]
+-    ) -> Optional[torch.Tensor]:
++        self, sample: SimNN.SimTensor, timestep: Union[SimNN.SimTensor, float, int]
++    ) -> Optional[SimNN.SimTensor]:
+         timesteps = timestep
+-        if not torch.is_tensor(timesteps):
++        if False: #not torch.is_tensor(timesteps):
+             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+             # This would be a good case for the `match` statement (Python 3.10+)
+             is_mps = sample.device.type == "mps"
+@@ -919,8 +934,8 @@ class UNet2DConditionModel(
+             else:
+                 dtype = torch.int32 if (is_mps or is_npu) else torch.int64
+             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+-        elif len(timesteps.shape) == 0:
+-            timesteps = timesteps[None].to(sample.device)
++        # elif len(timesteps.shape) == 0:
++        #     timesteps = timesteps[None].to(sample.device)
+ 
+         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+         timesteps = timesteps.expand(sample.shape[0])
+@@ -929,7 +944,7 @@ class UNet2DConditionModel(
+         # `Timesteps` does not contain any weights and will always return f32 tensors
+         # but time_embedding might actually be running in fp16. so we need to cast here.
+         # there might be better ways to encapsulate this.
+-        t_emb = t_emb.to(dtype=sample.dtype)
++        # t_emb = t_emb.to(dtype=sample.dtype)
+         return t_emb
+ 
+     def get_class_embed(self, sample: torch.Tensor, class_labels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+@@ -949,8 +964,8 @@ class UNet2DConditionModel(
+         return class_emb
+ 
+     def get_aug_embed(
+-        self, emb: torch.Tensor, encoder_hidden_states: torch.Tensor, added_cond_kwargs: Dict[str, Any]
+-    ) -> Optional[torch.Tensor]:
++        self, emb: SimNN.SimTensor, encoder_hidden_states: SimNN.SimTensor, added_cond_kwargs: Dict[str, Any]
++    ) -> Optional[SimNN.SimTensor]:
+         aug_emb = None
+         if self.config.addition_embed_type == "text":
+             aug_emb = self.add_embedding(encoder_hidden_states)
+@@ -1036,20 +1051,20 @@ class UNet2DConditionModel(
+             encoder_hidden_states = (encoder_hidden_states, image_embeds)
+         return encoder_hidden_states
+ 
+-    def forward(
++    def __call__(
+         self,
+-        sample: torch.Tensor,
+-        timestep: Union[torch.Tensor, float, int],
+-        encoder_hidden_states: torch.Tensor,
+-        class_labels: Optional[torch.Tensor] = None,
+-        timestep_cond: Optional[torch.Tensor] = None,
+-        attention_mask: Optional[torch.Tensor] = None,
++        sample: SimNN.SimTensor,
++        timestep: Union[SimNN.SimTensor, float, int],
++        encoder_hidden_states: SimNN.SimTensor,
++        class_labels: Optional[SimNN.SimTensor] = None,
++        timestep_cond: Optional[SimNN.SimTensor] = None,
++        attention_mask: Optional[SimNN.SimTensor] = None,
+         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+-        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+-        down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+-        mid_block_additional_residual: Optional[torch.Tensor] = None,
+-        down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+-        encoder_attention_mask: Optional[torch.Tensor] = None,
++        added_cond_kwargs: Optional[Dict[str, SimNN.SimTensor]] = None,
++        down_block_additional_residuals: Optional[Tuple[SimNN.SimTensor]] = None,
++        mid_block_additional_residual: Optional[SimNN.SimTensor] = None,
++        down_intrablock_additional_residuals: Optional[Tuple[SimNN.SimTensor]] = None,
++        encoder_attention_mask: Optional[SimNN.SimTensor] = None,
+         return_dict: bool = True,
+     ) -> Union[UNet2DConditionOutput, Tuple]:
+         r"""
+@@ -1294,7 +1309,6 @@ class UNet2DConditionModel(
+                     res_hidden_states_tuple=res_samples,
+                     upsample_size=upsample_size,
+                 )
+-
+         # 6. post-process
+         if self.conv_norm_out:
+             sample = self.conv_norm_out(sample)
+diff --git a/src/diffusers/models/upsampling.py b/src/diffusers/models/upsampling.py
+index 8a47c69f1..f2bb1d196 100644
+--- a/src/diffusers/models/upsampling.py
++++ b/src/diffusers/models/upsampling.py
+@@ -14,6 +14,11 @@
+ 
+ from typing import Optional, Tuple
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
++
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -73,7 +78,7 @@ class Upsample1D(nn.Module):
+         return outputs
+ 
+ 
+-class Upsample2D(nn.Module):
++class Upsample2D(SimNN.Module):
+     """A 2D upsampling layer with an optional convolution.
+ 
+     Parameters:
+@@ -91,6 +96,7 @@ class Upsample2D(nn.Module):
+ 
+     def __init__(
+         self,
++        objname: str,
+         channels: int,
+         use_conv: bool = False,
+         use_conv_transpose: bool = False,
+@@ -105,6 +111,7 @@ class Upsample2D(nn.Module):
+         interpolate=True,
+     ):
+         super().__init__()
++        self.name = objname
+         self.channels = channels
+         self.out_channels = out_channels or channels
+         self.use_conv = use_conv
+@@ -131,7 +138,7 @@ class Upsample2D(nn.Module):
+         elif use_conv:
+             if kernel_size is None:
+                 kernel_size = 3
+-            conv = nn.Conv2d(self.channels, self.out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
++            conv = ttsimF.Conv2d(f'{self.name}.conv2d', self.channels, self.out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
+ 
+         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
+         if name == "conv":
+@@ -139,7 +146,13 @@ class Upsample2D(nn.Module):
+         else:
+             self.Conv2d_0 = conv
+ 
+-    def forward(self, hidden_states: torch.Tensor, output_size: Optional[int] = None, *args, **kwargs) -> torch.Tensor:
++        super().link_op2module()
++
++    def interpolateop(self, input_tensor, scale_factor=1.0, mode="nearest"):
++        op = ttsimF.interpolate(f'{self.name}.interpop', scale_factor=scale_factor, mode=mode)
++        return op(input_tensor)
++
++    def __call__(self, hidden_states: SimNN.SimTensor, output_size: Optional[int] = None, *args, **kwargs) -> SimNN.SimTensor:
+         if len(args) > 0 or kwargs.get("scale", None) is not None:
+             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+             deprecate("scale", "1.0.0", deprecation_message)
+@@ -174,9 +187,11 @@ class Upsample2D(nn.Module):
+                 hidden_states = hidden_states.contiguous()
+ 
+             if output_size is None:
+-                hidden_states = F.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
++                # print(f'size of hidden_states: {hidden_states.shape}')
++                hidden_states = self.interpolateop(hidden_states, scale_factor=2.0, mode="nearest")
++                # print(f'size of hidden states after interp is {hidden_states.shape}')
+             else:
+-                hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
++                hidden_states = self.interpolateop(hidden_states, size=output_size, mode="nearest")
+ 
+         # Cast back to original dtype
+         if dtype == torch.bfloat16 and is_torch_version("<", "2.1"):
+diff --git a/src/diffusers/schedulers/scheduling_unipc_multistep.py b/src/diffusers/schedulers/scheduling_unipc_multistep.py
+index 162a34bd2..b02a3529b 100644
+--- a/src/diffusers/schedulers/scheduling_unipc_multistep.py
++++ b/src/diffusers/schedulers/scheduling_unipc_multistep.py
+@@ -25,6 +25,10 @@ from ..configuration_utils import ConfigMixin, register_to_config
+ from ..utils import deprecate, is_scipy_available
+ from .scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
+ 
++import os, sys
++sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
++import ttsim.front.functional.op as ttsimF
++import ttsim.front.functional.sim_nn as SimNN
+ 
+ if is_scipy_available():
+     import scipy.stats
+@@ -112,7 +116,7 @@ def rescale_zero_terminal_snr(betas):
+     return betas
+ 
+ 
+-class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
++class UniPCMultistepScheduler(SimNN.Module, SchedulerMixin, ConfigMixin):
+     """
+     `UniPCMultistepScheduler` is a training-free framework designed for the fast sampling of diffusion models.
+ 
+@@ -190,6 +194,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+     @register_to_config
+     def __init__(
+         self,
++        objname: str,
+         num_train_timesteps: int = 1000,
+         beta_start: float = 0.0001,
+         beta_end: float = 0.02,
+@@ -217,6 +222,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+         use_dynamic_shifting: bool = False,
+         time_shift_type: str = "exponential",
+     ):
++        super().__init__()
++        self.name = objname
+         if self.config.use_beta_sigmas and not is_scipy_available():
+             raise ImportError("Make sure to install scipy if you want to use beta sigmas.")
+         if sum([self.config.use_beta_sigmas, self.config.use_exponential_sigmas, self.config.use_karras_sigmas]) > 1:
+@@ -277,6 +284,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+         self._begin_index = None
+         self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+ 
++        super().link_op2module()
++
+     @property
+     def step_index(self):
+         """
+@@ -428,6 +437,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+         self._step_index = None
+         self._begin_index = None
+         self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
++        self.sigma = ttsimF._from_shape(f'{self.name}_sigma', self.sigmas.shape)
+ 
+     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
+     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
+@@ -580,11 +590,11 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+ 
+     def convert_model_output(
+         self,
+-        model_output: torch.Tensor,
++        model_output: SimNN.SimTensor,
+         *args,
+-        sample: torch.Tensor = None,
++        sample: SimNN.SimTensor = None,
+         **kwargs,
+-    ) -> torch.Tensor:
++    ) -> SimNN.SimTensor:
+         r"""
+         Convert the model output to the corresponding type the UniPC algorithm needs.
+ 
+@@ -952,9 +962,9 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+ 
+     def step(
+         self,
+-        model_output: torch.Tensor,
+-        timestep: Union[int, torch.Tensor],
+-        sample: torch.Tensor,
++        model_output: SimNN.SimTensor,
++        timestep: Union[int, SimNN.SimTensor],
++        sample: SimNN.SimTensor,
+         return_dict: bool = True,
+     ) -> Union[SchedulerOutput, Tuple]:
+         """

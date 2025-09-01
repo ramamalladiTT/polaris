@@ -45,11 +45,13 @@ def get_tensor_broadcast_shape(shape1, shape2):
     s1 = shape1[::-1]
     s2 = shape2[::-1]
     max_len = max(len(s1), len(s2))
-    s1.extend([1] * (max_len - len(s1)))
-    s2.extend([1] * (max_len - len(s2)))
+    s1_list = list(s1)
+    s1_list.extend([1] * (max_len - len(s1)))
+    s2_list = list(s2)
+    s2_list.extend([1] * (max_len - len(s2)))
 
     result = []
-    for d1, d2 in zip(s1, s2):
+    for d1, d2 in zip(s1_list, s2_list):
         if d1 == d2:
             result.append(d1)
         elif d1 == 1:
@@ -500,6 +502,72 @@ class GatherOp(SimOp):
                 'outBytes': int(outT[0].nbytes(self.precision)),
                 'instrs'  : {'mov': int(outT[0].nelems())}
                 }
+        return self.perf_stats
+
+class GroupNormalizationOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'GroupNormalization'
+        check_io_counts(self, in_counts=[1, 1], out_counts=[1, 1])
+        self._kw_args_defaults = {
+            'num_groups': 1,
+            'epsilon': 1e-5,
+            'axis': 1,
+        }
+        if 'attrs' in opinfo:
+            self.check_known_args(opinfo['attrs'])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+
+        X = inT[0]
+        assert X.check_shape(), f"Illegal Shape for {X}"
+        XShape = X.shape
+        XRank = X.rank()
+
+        num_groups = self.attrs.get('num_groups', 1)
+        epsilon = self.attrs.get('epsilon', 1e-5)
+        axis = self.attrs.get('axis', 1)
+
+        # Validate group count
+        assert XShape[axis] % num_groups == 0, f"Channels ({XShape[axis]}) not divisible by num_groups ({num_groups})"
+
+        # Compute group shape
+        N = XShape[0]
+        C = XShape[axis]
+        group_size = C // num_groups
+        group_shape = XShape[:axis] + [num_groups, group_size] + XShape[axis+1:]
+        reduction_shape = XShape[:axis] + [num_groups] + [1] * (XRank - axis - 1)
+
+        instr_count = {'add': 0, 'sub': 0, 'mul': 0, 'div': 0, 'rsqrt': 0, 'mac': 0}
+        input_count = X.nelems()
+        reduction_count = N * num_groups * reduce(operator.mul, XShape[axis+1:], 1)
+
+        # Mean and variance per group
+        instr_count['add'] += input_count
+        instr_count['div'] += reduction_count
+        instr_count['sub'] += input_count
+        instr_count['mul'] += input_count
+        instr_count['add'] += input_count
+        instr_count['div'] += reduction_count
+        instr_count['add'] += reduction_count
+        instr_count['rsqrt'] += reduction_count
+        instr_count['mul'] += input_count
+
+        # Affine transform
+        instr_count['mac'] += input_count
+
+        outT[0].shape = X.shape
+        outT[0].dtype = X.dtype
+
+        self.perf_stats = {
+            'inElems': inT[0].nelems(),
+            'outElems': outT[0].nelems(),
+            'inBytes': inT[0].nbytes(),
+            'outBytes': outT[0].nbytes(),
+            'instrs': instr_count
+        }
         return self.perf_stats
 
 class LayerNormalizationOp(SimOp):
@@ -2119,6 +2187,36 @@ class GeluOp(SimOp):
         else:
             return {}
 
+class SiluOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'Silu'
+        check_io_counts(self, in_counts=[1, 1], out_counts=[1, 1])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+        # SiLU(x) = x * sigmoid(x)
+        nElem = inT[0].nelems()
+        outT[0].shape = inT[0].shape
+        outT[0].dtype = inT[0].dtype
+        instr = {
+            'mov': nElem,      # for output
+            'mul': nElem,      # x * sigmoid(x)
+            'exp': nElem,      # sigmoid(x) = 1 / (1 + exp(-x))
+            'add': nElem,      # 1 + exp(-x)
+            'div': nElem,      # 1 / (1 + exp(-x))
+            'neg': nElem       # -x
+        }
+        self.perf_stats = {
+            'inElems': nElem,
+            'inBytes': inT[0].nbytes(),
+            'outElems': outT[0].nelems(),
+            'outBytes': outT[0].nbytes(),
+            'instrs': instr
+        }
+        return self.perf_stats
+
 class ReluOp(SimOp):
     def __init__(self, opinfo):
         super().__init__(opinfo)
@@ -2476,6 +2574,125 @@ class FlattenOp(SimOp):
 
         return self.perf_stats
 
+class PermuteOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'Permute'
+        check_io_counts( self, in_counts=[2,2], out_counts=[1,1] )
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+        outT[0].shape = [inT[0].shape[i] for i in inT[1].data]
+        outT[0].dtype = inT[0].dtype
+        self.perf_stats = {
+                'inElems' : inT[0].nelems(),
+                'outElems': outT[0].nelems(),
+                'inBytes' : inT[0].nbytes(),
+                'outBytes': outT[0].nbytes(),
+                'instrs'  : {'mov': outT[0].nelems()}
+                }
+        return self.perf_stats
+
+class InterpolateOp(SimOp):
+    """
+    Implements ONNX-style Interpolate (upsample) operation.
+    Supports 'nearest' and 'linear' modes for 1D/2D/3D.
+    Only the last 2 spatial dimensions are scaled by scale_factor.
+    """
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'Interpolate'
+        check_io_counts(self, in_counts=[1, 1], out_counts=[1, 1])
+        self._kw_args_defaults = {
+            'mode': 'nearest',  # or 'linear'
+            'align_corners': 0,
+            'axes': None,
+            'scale_factor': None,
+        }
+        if 'attrs' in opinfo:
+            self.check_known_args(opinfo['attrs'])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+
+        X = inT[0]
+        assert X.check_shape(), f"Illegal Shape for {X}"
+        mode = self.attrs.get('mode', 'nearest')
+        align_corners = self.attrs.get('align_corners', 0)
+        scale_factor = kwargs.get('scale_factor', self.attrs.get('scale_factor', None))
+        assert scale_factor is not None, "scale_factor argument must be provided"
+
+        # Only scale the last 2 dimensions
+        if isinstance(scale_factor, (float, int)):
+            scale_factors = [float(scale_factor)] * 2
+        else:
+            scale_factors = [float(s) for s in scale_factor]
+            if len(scale_factors) == 1:
+                scale_factors = scale_factors * 2
+            assert len(scale_factors) == 2, "scale_factor must have 2 elements for last 2 dims"
+
+        output_shape = list(X.shape)
+        for i, axis in enumerate(range(X.rank() - 2, X.rank())):
+            output_shape[axis] = int(np.floor(X.shape[axis] * scale_factors[i]))
+
+        outT[0].shape = output_shape
+        outT[0].dtype = X.dtype
+
+        nElem_in = X.nelems()
+        nElem_out = np.prod(output_shape)
+        instr = {}
+        if mode == 'nearest':
+            instr = {'mov': int(nElem_out)}
+        elif mode == 'linear':
+            instr = {'mul': int(nElem_out * 2), 'add': int(nElem_out * 2), 'mov': int(nElem_out)}
+        else:
+            instr = {'mov': int(nElem_out)}  # fallback
+
+        self.perf_stats = {
+            'inElems': nElem_in,
+            'inBytes': X.nbytes(),
+            'outElems': int(nElem_out),
+            'outBytes': int(nElem_out) * X.dtype.itemsize,
+            'instrs': instr
+        }
+        return self.perf_stats
+
+class BMMOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'BMM'
+        check_io_counts(self, in_counts=[2, 2], out_counts=[1, 1])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+
+        A = inT[0]
+        B = inT[1]
+        assert A.rank() >= 3 and B.rank() >= 3, "BMM expects rank >= 3 for both inputs"
+        # Broadcasting batch dims
+        batch_shape = get_tensor_broadcast_shape(A.shape[:-2], B.shape[:-2])
+        m, k1 = A.shape[-2], A.shape[-1]
+        k2, n = B.shape[-2], B.shape[-1]
+        assert k1 == k2, f"Incompatible inner dimensions for BMM: {k1} != {k2}"
+        out_shape = batch_shape + [m, n]
+        outT[0].shape = out_shape
+        outT[0].dtype = A.dtype
+        batch_elems = int(np.prod(batch_shape)) if batch_shape else 1
+        macs_per_matmul = m * n * k1
+        total_macs = batch_elems * macs_per_matmul
+
+        self.perf_stats = {
+            'inElems': A.nelems() + B.nelems(),
+            'outElems': outT[0].nelems(),
+            'inBytes': A.nbytes() + B.nbytes(),
+            'outBytes': outT[0].nbytes(),
+            'instrs': {'mac': total_macs}
+        }
+        return self.perf_stats
+
 class VoxelPoolingOp(SimOp):
     """
       Needed for BEVDepth, where it is implemented as a custom CUDA Operator
@@ -2566,10 +2783,13 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             ConstantOp           : ['Constant'],
             GatherOp             : ['Gather'],
             LayerNormalizationOp : ['LayerNormalization'],
+            GroupNormalizationOp : ['GroupNormalization'],
             MatMulOp             : ['MatMul'],
+            BMMOp                : ['BMM'],
             SplitOp              : ['Split'],
             ReshapeOp            : ['Reshape'],
             TransposeOp          : ['Transpose'],
+            PermuteOp            : ['Permute'],
             WhereOp              : ['Where'],
             SoftmaxOp            : ['Softmax'],
             PowOp                : ['Pow'],
@@ -2577,6 +2797,7 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             SqueezeOp            : ['Squeeze'],
             TileOp               : ['Tile'],
             ConcatOp             : ['Concat'],
+            InterpolateOp        : ['Interpolate'],
             SliceOp              : ['Slice'],
             TriluOp              : ['Trilu'],
             DropoutOp            : ['Dropout'],
@@ -2586,6 +2807,7 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             RangeOp              : ['Range'],
             GeluOp               : ['Gelu'],
             ReluOp               : ['Relu'],
+            SiluOp               : ['Silu'],
             LeakyReluOp          : ['LeakyRelu'], #Yolo-v7
             SigmoidOp            : ['Sigmoid'], #Yolo-v7
             ResizeOp             : ['Resize'], #Yolo-v7

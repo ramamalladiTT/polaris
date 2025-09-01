@@ -55,11 +55,15 @@ def get_output(name):
 def get_opinfo(name, optype, **kwargs):
     return {'name': name, 'optype': optype, 'attrs': kwargs, 'domain': 'ttsim.common', 'inList': []}
 
-def get_sim_op(opinfo):
+def get_sim_op(opinfo, input_precision = np.float32):
     optype: str = opinfo['optype']
     opcls = SimOpFactory(optype)
     opobj = opcls(opinfo)
-    opobj.set_precision(WL2ArchTypeSpec.layer_2_datatype(optype.upper()))
+    # Check if WL2ArchTypeSpec is not None and has the required method
+    if WL2ArchTypeSpec.instance is not None:
+        opobj.set_precision(WL2ArchTypeSpec.layer_2_datatype(optype.upper()))
+    else:
+        opobj.set_precision(input_precision)
     return opobj
 
 #####################################################################################################
@@ -115,11 +119,12 @@ class SimOpHandle:
         self.opinfo['outList'] = [self.otensor.name]
 
         #create relevant SimOp
-        self.sim_op = get_sim_op(self.opinfo)
+        self.sim_op = get_sim_op(self.opinfo, input_precision=xinput[0].dtype)
 
         #get perf stats for the SimOp -- this also ensures that the output tensor shape/data
         #is well formed
         self.perf_stats = self.sim_op.get_perf_counts(xinput,[self.otensor])
+        print(f'{self.optype}:: {self.perf_stats}')
         self.sim_op.update_tensor_counts(xinput,[self.otensor])
 
         #return result
@@ -193,7 +198,7 @@ class SplitOpHandle:
         self.opinfo['outList'] = [ot.name for ot in self.otensors]
 
         #create relevant SimOp
-        self.sim_op = get_sim_op(self.opinfo)
+        self.sim_op = get_sim_op(self.opinfo, input_precision=x.dtype)
 
         #get perf stats for the SimOp -- this also ensures that the output tensor shape/data
         #is well formed
@@ -245,7 +250,7 @@ class VariadicInputOpHandle:
         self.opinfo['outList'] = [self.otensor.name]
 
         #create relevant SimOp
-        self.sim_op = get_sim_op(self.opinfo)
+        self.sim_op = get_sim_op(self.opinfo, input_precision=xinput[0].dtype)
 
         #get perf stats for the SimOp -- this also ensures that the output tensor shape/data
         #is well formed
@@ -420,6 +425,27 @@ def MaxPool2d(name, kernel_size, **kwargs):
                           )
     return op_hndl
 
+def interpolate(name, **kwargs):
+    op_hndl = SimOpHandle(name, 'Interpolate', params=[], ipos=[0], **kwargs)
+    return op_hndl
+
+def GroupNorm(name="group_norm", num_groups=1, num_channels=1, /, **kwargs):
+    # GroupNorm typically has two learnable parameters: weight and bias, both of shape [num_channels]
+    # weight = _from_shape(name + '.weight', [num_channels], is_param=True)
+    # weight.op_in.append(name)
+    # bias = _from_shape(name + '.bias', [num_channels], is_param=True)
+    # bias.op_in.append(name)
+    # GroupNormalizationOp expects input 0: input tensor, input 1: weight, input 2: bias
+    # num_groups is passed as an attribute
+    kwargs = {'num_groups': num_groups}
+    op_hndl = SimOpHandle(
+        name,
+        'GroupNormalization',
+        params=[], #(1, weight), (2, bias)],
+        ipos=[0],
+        **kwargs
+    )
+    return op_hndl
 
 def Dropout(name, prob=0.5, train_mode=True, /, **kwargs):
     #SimTensor(/drop/Dropout_output_1) shape=[1, 7, 48], dtype=bool, op_in=[], op_out=['/drop/Dropout'], data=None
@@ -500,6 +526,7 @@ Shape         = partial(UnaryOperator, optype='Shape')
 Transpose     = partial(UnaryOperator, optype='Transpose')
 Gelu          = partial(UnaryOperator, optype='Gelu')
 Relu          = partial(UnaryOperator, optype='Relu')
+Silu          = partial(UnaryOperator, optype='Silu')
 LeakyReLU     = partial(UnaryOperator, optype='LeakyRelu')
 Sigmoid       = partial(UnaryOperator, optype='Sigmoid')
 AveragePool2d = partial(UnaryOperator, optype='AveragePool')
@@ -512,7 +539,9 @@ Mul            = partial(BinaryOperator, optype='Mul')
 Div            = partial(BinaryOperator, optype='Div')
 Gather         = partial(BinaryOperator, optype='Gather')
 MatMul         = partial(BinaryOperator, optype='MatMul')
+bmm            = partial(BinaryOperator, optype='BMM')
 Reshape        = partial(BinaryOperator, optype='Reshape')
+permute        = partial(BinaryOperator, optype='Permute')
 Pow            = partial(BinaryOperator, optype='Pow')
 Unsqueeze      = partial(BinaryOperator, optype='Unsqueeze')
 Squeeze        = partial(BinaryOperator, optype='Squeeze')
