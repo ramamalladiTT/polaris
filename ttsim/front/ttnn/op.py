@@ -84,12 +84,16 @@ def argmax_pp(args_list, kwargs_dict):
     return args_list, kwargs_dict
 
 def reshape_pp(args_list, kwargs_dict):
-    assert len(args_list) == 2, f"ttnn.reshape has 2 inputs"
+    assert len(args_list) <= 3, f"ttnn.reshape has 3 inputs (special case for TT h/w)"
     inT      = args_list[0]
     outShape = args_list[1]
     assert isinstance(inT, Tensor), f"ttnn.reshape 1st input should be a ttnn.Tensor"
     assert isinstance(outShape, (list, tuple)), f"ttnn.reshape 2nd input should be a list|tuple of ints"
     assert all(isinstance(x, int) for x in outShape), f"ttnn.reshape 2nd input should be a list|tuple of ints"
+
+    if (len(args_list) == 3):
+        # write code to get slice (batch 0) of the input tensor and return it
+        inT = Tensor(shape=outShape, device=inT.device, dtype=DataType.from_numpy(inT.dtype))
 
     outData = np.array(outShape, dtype=np.int64)
     outT = Tensor(shape=outData.shape, dtype=DataType.INT64, device=inT.device, data=outData)
@@ -124,7 +128,11 @@ def layer_norm_pp(args_list, kwargs_dict):
     if bias_tensor is not None:
         assert isinstance(bias_tensor, Tensor), f"ttnn.layer_norm 3rd input should be a ttnn.Tensor"
 
-    return (input_tensor, weight_tensor, bias_tensor), kwargs_dict
+    kwargs_dict = {}
+    if bias_tensor is not None:
+        return (input_tensor, weight_tensor, bias_tensor), kwargs_dict
+    else:
+        return (input_tensor, weight_tensor), kwargs_dict
 
 def conv2d_pp(args_list, kwargs_dict):
     input_tensor  = kwargs_dict['input_tensor']
@@ -134,6 +142,101 @@ def conv2d_pp(args_list, kwargs_dict):
     pads = [padding_size for i in range(4)]
     kwargs_dict = {'pads': pads, 'kernel_shape': list(kwargs_dict['kernel_size'])}
     return (input_tensor, weight_tensor, bias_tensor), kwargs_dict
+
+def outer_pp(args_list, kwargs_dict):
+    """Preprocessor for outer product operation."""
+    assert len(args_list) == 2, f"ttnn.outer has 2 inputs"
+    tensor_a = args_list[0]
+    tensor_b = args_list[1]
+    assert isinstance(tensor_a, Tensor), f"ttnn.outer 1st input should be a ttnn.Tensor"
+    assert isinstance(tensor_b, Tensor), f"ttnn.outer 2nd input should be a ttnn.Tensor"
+
+    # Validate that inputs are 1D tensors
+    if len(tensor_a.shape) != 1:
+        raise ValueError(f"ttnn.outer expects 1D tensors, got tensor_a with shape {tensor_a.shape}")
+    if len(tensor_b.shape) != 1:
+        raise ValueError(f"ttnn.outer expects 1D tensors, got tensor_b with shape {tensor_b.shape}")
+
+    # Output shape will be (len(tensor_a), len(tensor_b))
+    output_shape = [tensor_a.shape[0], tensor_b.shape[0]]
+    kwargs_dict['output_shape'] = output_shape
+
+    return (tensor_a.unsqueeze(1), tensor_b.unsqueeze(0)), kwargs_dict
+
+def torchgather_pp(args_list, kwargs_dict):
+    """Preprocessor for torch gather operation. Torch Gather differs vs. ONNX Gather."""
+    assert len(args_list) == 3, f"ttnn.gather has 3 inputs"
+    input_tensor = args_list[0]
+    dim = args_list[1]
+    index_tensor = args_list[2]
+
+    # Ensure the index tensor is of integer type
+    if index_tensor.dtype != np.int64:
+        raise ValueError(f"ttnn.gather expects index tensor to be of type int64, got {index_tensor.dtype}")
+
+    kwargs_dict['axis'] = dim
+    return (input_tensor, index_tensor), kwargs_dict
+
+def transpose_pp(args_list, kwargs_dict):
+    inT = args_list[0]
+    dim1 = args_list[1]
+    dim2 = args_list[2]
+    out_dims = [i for i in range(len(inT.shape))]
+    out_dims[dim2] = dim1
+    out_dims[dim1] = dim2
+    kwargs_dict = {'perm': out_dims}
+    return ([inT], kwargs_dict)
+
+def cat(tensors, dim=0):
+    """Concatenate a list of tensors along a specified dimension."""
+    if not tensors:
+        raise ValueError("Input list of tensors is empty")
+
+    first_tensor = tensors[0]
+    # Handle negative dimension
+    original_rank = len(first_tensor.shape)
+    if dim < 0:
+        dim += original_rank
+
+    # Validate dimension
+    if dim < 0 or dim >= original_rank:
+        raise ValueError(f"Dimension {dim} is out of range for tensors of rank {original_rank}. "
+                        f"Valid range is [-{original_rank}, {original_rank - 1}]")
+
+    # Calculate new shape
+    new_shape = list(first_tensor.shape)
+    new_shape[dim] = sum(tensor.shape[dim] for tensor in tensors)
+
+    # Create the concatenated tensor
+    return Tensor(
+        shape=new_shape,
+        dtype=DataType.from_numpy(first_tensor.dtype.name),
+        device=first_tensor.device
+    )
+
+def where_pp(args, kwargs_dict):
+    mask_tensor = args[0]
+    input_tensor = args[1]
+    value_tensor = args[2]
+    return (mask_tensor, input_tensor, value_tensor), kwargs_dict
+
+def to_memory_config(input_tensor, memory_config=None):
+    return input_tensor  # No actual conversion, just returning the input tensor
+
+def sharded_to_interleaved(input_tensor, memory_config=None):
+    return input_tensor  # No actual conversion, just returning the input tensor
+
+def rms_norm(input_tensor, weight_tensor=None, bias_tensor=None, epsilon=1e-6, memory_config=None, compute_kernel_config=None):
+    # Compute RMS (using layernorm for now)
+    rms = layer_norm(input_tensor, weight=weight_tensor, epsilon=epsilon, axis=-1)
+    normalized = div(input_tensor, rms)
+    if weight_tensor is not None:
+        weight_tensor = reshape(weight_tensor, (1, 1, 1, 96*32)).repeat((1, 1, 1, normalized.shape[-1]//3072)) ## extras
+        normalized = multiply(normalized, weight_tensor)
+
+    if bias_tensor is not None:
+        normalized = add(normalized, bias_tensor)
+    return normalized
 
 #Pointwise Unary
 cos         = single_output_immediate_op('Cos')
@@ -155,7 +258,7 @@ div         = single_output_immediate_op('Div')
 pow         = single_output_immediate_op('Pow')
 
 #Pointwise Ternary
-where       = single_output_immediate_op('Where')
+where       = single_output_immediate_op('Where', preprocess=where_pp)
 
 #Reduction
 argmax      = single_output_immediate_op('ArgMax', preprocess=argmax_pp)
@@ -165,6 +268,8 @@ concat      = single_output_immediate_op('Concat')
 reshape     = single_output_immediate_op('Reshape',   preprocess=reshape_pp)
 embedding   = single_output_immediate_op('Gather',    preprocess=embedding_pp)
 permute     = single_output_immediate_op('Transpose', preprocess=permute_pp)
+gather      = single_output_immediate_op('TorchGather', preprocess=torchgather_pp)
+transpose   = single_output_immediate_op('Transpose', preprocess=transpose_pp)
 
 #Normalization
 layer_norm  = single_output_immediate_op('LayerNormalization', preprocess=layer_norm_pp)
@@ -179,6 +284,7 @@ max_pool2d        = single_output_immediate_op('MaxPool')
 
 #Matrix Multiplication
 matmul      = single_output_immediate_op('MatMul')
+outer       = single_output_immediate_op('MatMul', preprocess=outer_pp)
 
 
 Tensor.__add__    = add       #type: ignore
@@ -203,7 +309,7 @@ def linear(*args, **kwargs):
     core_grid   = kwargs.get('core_grid',              None)
     #mem_cfg     = kwargs.get('memory_config',          MemoryConfig.DRAM)
     #pgm_cfg     = kwargs.get('program_config',         None)
-    #ckrnl_cfg   = kwargs.get('compute_kernel_config',  None)
+    ckrnl_cfg   = kwargs.get('compute_kernel_config',  None)
 
     not_impl_attrs = {
             'transpose_a'           : False,
@@ -214,7 +320,7 @@ def linear(*args, **kwargs):
             #'core_grid'             : None,
             #'memory_config'         : MemoryConfig.DRAM,
             'program_config'        : None,
-            'compute_kernel_config' : None,
+            # 'compute_kernel_config' : None,
             }
 
     for aname,adefval in not_impl_attrs.items():

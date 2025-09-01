@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-from .device import open_device, close_device, ARCH
-from .tensor import _rand, full, zeros, ones, from_torch, to_torch, to_layout, to_device, DataType
-from .tensor import Layout, Shape
+from .device import open_device, close_device, ARCH, num_cores_to_corerangeset, create_sharded_memory_config
+from .device import interleaved_to_sharded
+from .tensor import _rand, full, zeros, ones, from_torch, to_torch, to_layout, to_device, DataType, ShardTensor2dMesh, typecast
+from .tensor import Layout, Shape, as_tensor, arange, stack, ShardStrategy, ShardOrientation, unsqueeze_to_4D, ReplicateTensorToMesh
 from .config import Conv2dConfig, WormholeComputeKernelConfig, init_device_compute_kernel_config
 from .config import MatmulMultiCoreReuseMultiCast1DProgramConfig
 from .buffer import TensorMemoryLayout, ShardOrientation, BufferType
@@ -16,9 +17,13 @@ float32  = DataType.FLOAT32
 bfloat16 = DataType.BFLOAT16
 int64    = DataType.INT64
 uint32   = DataType.UINT32
+bfloat8_b = DataType.BFLOAT8_B
+bool      = DataType.BOOL
+int32     = DataType.INT32
 
 ROW_MAJOR_LAYOUT = Layout.ROW_MAJOR_LAYOUT
 TILE_LAYOUT      = Layout.TILE_LAYOUT
+TILE_SIZE        = 32
 
 DRAM_MEMORY_CONFIG = MemoryConfig.DRAM
 L1_MEMORY_CONFIG   = MemoryConfig.L1

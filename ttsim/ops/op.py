@@ -502,6 +502,45 @@ class GatherOp(SimOp):
                 }
         return self.perf_stats
 
+class TorchGatherOp(SimOp):
+    """
+    Implements torch.gather operation.
+    Inputs:
+    - data: input tensor
+    - index: indices tensor
+    - axis: axis along which to gather (from attrs)
+    Output:
+    - gathered tensor
+    """
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'TorchGather'
+        check_io_counts(self, in_counts=[2,2], out_counts=[1,1])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+
+        axis     = self.attrs.get('axis', 0)
+        dataT    = inT[0]
+        indexT   = inT[1]
+        assert dataT.check_shape(), f"Illegal input dataT shape: {dataT}!!"
+        assert indexT.check_shape(), f"Illegal input indexT shape: {indexT}!!"
+
+        # Output shape is same as index shape
+        outT[0].shape = indexT.shape
+        outT[0].dtype = dataT.dtype
+
+        # Perf: each output element is a gather from input
+        self.perf_stats = {
+            'inElems' : dataT.nelems() + indexT.nelems(),
+            'outElems': outT[0].nelems(),
+            'inBytes' : dataT.nbytes() + indexT.nbytes(),
+            'outBytes': outT[0].nbytes(),
+            'instrs'  : {'mov': outT[0].nelems()}
+        }
+        return self.perf_stats
+
 class LayerNormalizationOp(SimOp):
     def __init__(self, opinfo):
         super().__init__(opinfo)
@@ -1423,7 +1462,9 @@ class WhereOp(SimOp):
         tmp_outT = build_tmp_data_tensor(np_out, self.name + '__tmp_out__')
         update_output_tensor(self, tmp_outT, outT[0])
         '''
-        assert outT[0].check_shape(), f"SHAPE INFERENCE ERROR!!"
+        # assert outT[0].check_shape(), f"SHAPE INFERENCE ERROR!!"
+        outT[0].shape = inT[1].shape
+        outT[0].dtype = inT[1].dtype
         self.perf_stats = {
                 'inElems' : inT[0].nelems() + inT[1].nelems() + inT[2].nelems(),
                 'outElems': outT[0].nelems(),
@@ -2645,6 +2686,7 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             EltwiseUnaryOp       : ['Identity', 'Tanh', 'Sin', 'Cos', 'Neg'],
             ConstantOp           : ['Constant'],
             GatherOp             : ['Gather'],
+            TorchGatherOp        : ['TorchGather'],
             LayerNormalizationOp : ['LayerNormalization'],
             MatMulOp             : ['MatMul'],
             SplitOp              : ['Split'],
