@@ -172,7 +172,7 @@ class SplitOpHandle:
         s += f"    perf_stats : {self.perf_stats}\n"
         return s
 
-    def __call__(self, x):
+    def __call__(self, x, y=None):
         #ensure axis is within x.rank bounds
         if self.axis < 0:
             axis = x.rank() + self.axis
@@ -185,8 +185,9 @@ class SplitOpHandle:
         out_dim = x.shape[axis] // self.count
         assert out_dim >= 1, f"SplitOpHandle: out_dim={out_dim} should be >=1"
 
-        y = _from_data(self.name + '.in2', np.array([out_dim for _ in range(self.count)],
-                                                    dtype=np.int64), is_param=False, is_const=True)
+        if y is None:
+            y = _from_data(self.name + '.in2', np.array([out_dim for _ in range(self.count)],
+                                                        dtype=np.int64), is_param=False, is_const=True)
         self.implicit_inputs.append(y)
 
         #input tensor setup
@@ -493,6 +494,19 @@ def Resize(name: str, /, scale_factor, **kwargs):
     op_hndl = SimOpHandle(name, 'Resize', params=[(1, roi), (2, scales)], ipos=[0], **kwargs)
     return op_hndl
 
+def Split(name, **kwargs):
+    return SplitOpHandle(name, params=[], ipos=[0, 1], **kwargs)
+
+def conv1d(name, **kwargs):
+    op_hndl = SimOpHandle(
+        name,
+        'Conv',
+        params=[],
+        ipos=[0, 1, 2],
+        **kwargs
+    )
+    return op_hndl
+
 ######################################################################################################
 # Simple Operator Mapping
 ######################################################################################################
@@ -504,17 +518,25 @@ UnaryOperator = partial(UniversalOperator, params=[], ipos=[0])
 Identity      = partial(UnaryOperator, optype='Identity')
 Tanh          = partial(UnaryOperator, optype='Tanh')
 Neg           = partial(UnaryOperator, optype='Neg')
+exp           = partial(UnaryOperator, optype='Exp')
 Cos           = partial(UnaryOperator, optype='Cos')
 Sin           = partial(UnaryOperator, optype='Sin')
+Log           = partial(UnaryOperator, optype='Log')
 Softmax       = partial(UnaryOperator, optype='Softmax')
+softplus      = partial(UnaryOperator, optype='Softplus')
+clamp         = partial(UnaryOperator, optype='Clamp')
 Cast          = partial(UnaryOperator, optype='Cast')
 Shape         = partial(UnaryOperator, optype='Shape')
 Transpose     = partial(UnaryOperator, optype='Transpose')
 Gelu          = partial(UnaryOperator, optype='Gelu')
 Relu          = partial(UnaryOperator, optype='Relu')
+SiLU          = partial(UnaryOperator, optype='Silu')
 LeakyReLU     = partial(UnaryOperator, optype='LeakyRelu')
 Sigmoid       = partial(UnaryOperator, optype='Sigmoid')
 AveragePool2d = partial(UnaryOperator, optype='AveragePool')
+sum           = partial(UnaryOperator, optype='Sum')
+mean          = partial(UnaryOperator, optype='Mean')
+rsqrt         = partial(UnaryOperator, optype='Rsqrt')
 
 #Binary Operators
 BinaryOperator = partial(UniversalOperator, params=[], ipos=[0,1])
@@ -530,6 +552,7 @@ Unsqueeze      = partial(BinaryOperator, optype='Unsqueeze')
 Squeeze        = partial(BinaryOperator, optype='Squeeze')
 Tile           = partial(BinaryOperator, optype='Tile')
 Equal          = partial(BinaryOperator, optype='Equal')
+assign         = partial(BinaryOperator, optype='Assign')
 
 #Ternary Operators
 TernaryOperator = partial(UniversalOperator, params=[], ipos=[0,1,2])
