@@ -23,11 +23,15 @@ def test_llama2_forward():
     batch_size = 1
     seqlen = 1
      # Create random token indices in vocab range
-    tokens = F._from_shape('input_tokens', [batch_size, seqlen])
-    out = model(tokens, start_pos=0)
+    # tokens = F._from_shape('input_tokens', [batch_size, seqlen])
+    model.create_input_tensors()
+    out = model() #tokens, start_pos=0)
     print('Output shape:', out.shape)
     assert out.shape == [batch_size, seqlen, args.vocab_size], 'Mismatched output shape'
     print('Test passed!')
+    gg = model.get_forward_graph()
+    print('Dumping ONNX...')
+    gg.graph2onnx('llama2.onnx', do_model_check=False)
 
 if __name__ == "__main__":
     test_llama2_forward()

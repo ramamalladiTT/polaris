@@ -33,14 +33,15 @@ class RMSNorm(SimNN.Module):
         self.name = objname
         self.eps = eps
         self.weight = F._from_shape(f'{self.name}_weight', shape=[dim], is_param=True)
-        self.mulop = F.Mul(f'{self.name}_mulop')
+        self.mulopx2 = F.Mul(f'{self.name}_mulopx2')
         self.meanop = F.mean(f'{self.name}_meanop', dim=-1)
         self.rsqrtop = F.rsqrt(f'{self.name}_rsqrtop')
-        self.mulopx2 = F.Mul(f'{self.name}_mulopx2')
+        self.mulop = F.Mul(f'{self.name}_mulop')
         super().link_op2module()
 
     def _norm(self, x):
-        mu = self.meanop(self.mulopx2(x, x)).unsqueeze(-1) ## y_flat.pow(2) substituted with mul ## unsqueeze for keepdim=True
+        x2 = self.mulopx2(x,x)
+        mu = self.meanop(x2).unsqueeze(-1) ## y_flat.pow(2) substituted with mul ## unsqueeze for keepdim=True
         rmsnorm_eps_tensor = F._from_shape('rmsnorm_eps', shape=mu.shape)
         return x * self.rsqrtop(mu + rmsnorm_eps_tensor)
 
@@ -49,17 +50,23 @@ class RMSNorm(SimNN.Module):
         y = self.mulop(output, self.weight)
         return y
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, module=None):
-    freqs_t = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)] / dim))
-    t_t = np.arange(end)
-    freqs = F._from_shape('freqs', shape=[1, len(freqs_t)])
-    t = F._from_shape('t', shape=[len(t_t), 1])
-    matmulop = F.MatMul('matmul_freqs')
-    matmulop.set_module(module)
-    freqs_cis = matmulop(t, freqs)[0:1, :]
-    freqs_cis_shape = freqs_cis.shape
-    freqs_cis= F._from_shape('freqs_cis', [*freqs_cis_shape, 2])
-    return freqs_cis
+class Precompute(SimNN.Module):
+    def __init__(self, objname, dim: int, end: int, theta: float = 10000.0):
+        super().__init__()
+        self.name = objname
+        freqs_t = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)] / dim))
+        t_t = np.arange(end)
+        self.freqs = F._from_shape('freqs', shape=[1, len(freqs_t)])
+        self.t = F._from_shape('t', shape=[len(t_t), 1])
+        self.matmulop = F.MatMul('matmul_freqs')
+        super().link_op2module()
+
+    def __call__(self):
+        matmulout = self.matmulop(self.t, self.freqs)
+        freqs_cis = matmulout[0:1, :]
+        freqs_cis_shape = freqs_cis.shape
+        freqs_cis= F._from_shape('freqs_cis', [*freqs_cis_shape, 2])
+        return freqs_cis
 
 def reshape_for_broadcast(freqs_cis: SimNN.SimTensor, x: SimNN.SimTensor) -> SimNN.SimTensor:
     ndim = len(x.shape)
@@ -87,7 +94,7 @@ def repeat_kv(x: SimNN.SimTensor, n_rep: int) -> SimNN.SimTensor:
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    assert n_rep == 1, 'n_rep should be 1!'
+    assert n_rep == 1, 'Implementation supports only n_rep == 1!'
     # return (
     #     x[:, :, :, None, :]
     #     .expand(bs, slen, n_kv_heads, n_rep, head_dim)
@@ -267,29 +274,32 @@ class Transformer(SimNN.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
-        import os
 
-        super().link_op2module()
         self.tok_embeddings = F.Embedding(f'{self.name}_tok_embeddings',
-            params.vocab_size, params.dim#, init_method=lambda x: x
+            params.vocab_size, params.dim
         )
-
-        self.layers = [] # torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(f'{self.name}_layer_{layer_id}', layer_id, params))
-
+        self.layers = SimNN.ModuleList([TransformerBlock(f'{self.name}_layer_{i}', i, params) for i in range(self.n_layers)])
         self.norm = RMSNorm(f'{self.name}_rmsnorm', params.dim, eps=params.norm_eps)
         self.output = F.Linear(f'{self.name}_output',
-            params.dim, params.vocab_size, bias=False#, init_method=lambda x: x
+            params.dim, params.vocab_size, bias=False
         )
+        precompute_obj = Precompute(f'{self.name}_precompute', self.params.dim // self.params.n_heads,
+                                    self.params.max_seq_len * 2)
+        self.freqs_cis = precompute_obj()
+        super().link_op2module()
 
-        self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
-            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2, module=self
-        )
+    def create_input_tensors(self):
+        self.input_tensors = {
+                'x_in': F._from_shape('input_tokens', [1, 1]),
+        }
+        return
 
-    def __call__(self, tokens: SimNN.SimTensor, start_pos: int):
+    def get_forward_graph(self):
+        GG = super()._get_forward_graph(self.input_tensors)
+        return GG
+
+    def __call__(self, tokens: SimNN.SimTensor = None, start_pos: int = 0): # type: ignore[assignment]
+        tokens = self.input_tensors['x_in'] if tokens is None else tokens
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis.set_module(self)
@@ -298,14 +308,6 @@ class Transformer(SimNN.Module):
         mask = None
         if seqlen > 1:
             assert "Simulation for sequence length > 1 is not implemented yet!"
-            # mask = torch.full(
-            #     (seqlen, seqlen), float("-inf"), device=tokens.device
-            # )
-            # mask = torch.triu(mask, diagonal=1)
-            # mask = torch.hstack([
-            #     torch.zeros((seqlen, start_pos), device=tokens.device),
-            #     mask
-            # ]).type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
